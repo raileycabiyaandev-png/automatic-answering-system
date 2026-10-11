@@ -24,7 +24,6 @@
       "matches": [
         "http://localhost/*",
         "http://127.0.0.1/*",
-        "https://automatic-answering-system.onrender.com/*",
         "https://semestral.amaes.com/2612/*"
       ],
       "js": [

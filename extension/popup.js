@@ -113,6 +113,7 @@ async function init() {
 
 // The popup talks directly to the page you are looking at.
 
+
 async function sendToActiveTab(payload) {
     const [tab] = await chrome.tabs.query({
         active: true,
@@ -126,17 +127,25 @@ async function sendToActiveTab(payload) {
     try {
         return await chrome.tabs.sendMessage(tab.id, payload);
     } catch (error) {
-        console.error("Content script communication failed:", {
-            tabUrl: tab.url,
-            messageType: payload?.type,
-            error: error?.message
-        });
+        const details = {
+            tabUrl: tab.url ?? "Unknown URL",
+            messageType: payload?.type ?? "Unknown message",
+            error: error?.message ?? String(error)
+        };
+
+        console.error(
+            "Content script communication failed:",
+            JSON.stringify(details, null, 2)
+        );
 
         throw new Error(
-            "This page is not ready. Refresh the page, then press Start."
+            `Could not contact the page script. ` +
+            `Message: ${details.messageType}. ` +
+            `Cause: ${details.error}`
         );
     }
 }
+
 
 
 function readAutomationSettings() {
