@@ -2,7 +2,7 @@
 "use strict";
 
 // URL of your local FastAPI backend.
-const API_BASE = "http://127.0.0.1:8000";
+const API_BASE = "https://automatic-answering-system.onrender.com";
 
 
 chrome.runtime.onMessage.addListener(
