@@ -22,7 +22,8 @@
     {
       "matches": [
         "http://localhost/*",
-        "http://127.0.0.1/*"
+        "http://127.0.0.1/*",
+        "https://semestral.amaes.com/2612/mod/quiz/attempt.php?attempt=170693&cmid=4007*/"
       ],
       "js": [
         "content.js"
