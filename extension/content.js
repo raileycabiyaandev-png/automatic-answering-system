@@ -5,6 +5,18 @@ console.log(
     window.location.href
 );
 
+// ============================================================
+// ALLOWED SITES
+// Auto-answering only works on these sites. Keep this list the
+// same as the "matches" list in manifest.json.
+// To use a quiz site that YOU built and host, add its domain
+// here, for example: "my-own-quiz-site.com"
+// ============================================================
+const ALLOWED_HOSTS = [
+    "localhost",
+    "127.0.0.1"
+];
+
 let enabled = false;
 let subject = "";
 
@@ -1121,6 +1133,8 @@ function sleep(milliseconds) {
 }
 
 
+// True only on the sites listed in ALLOWED_HOSTS (at the top of
+// this file). Subdomains of an allowed site also count.
 function isLocalPracticePage() {
     const host = location.hostname;
 
@@ -1631,6 +1645,19 @@ async function startRunner() {
         // The database answers in a moment, and every question
         // that needs the AI travels in ONE request.
         prefetchAhead(blocks, 0, blocks.length);
+
+        // Tell the user something is happening (the backend can
+        // take a little while to wake up the first time).
+        showOverlay(
+            [
+                `Found ${blocks.length} questions.`,
+                "Looking up the answers...",
+                "",
+                "The first request can take up to a minute if the",
+                "backend was asleep."
+            ].join("\n"),
+            "info"
+        );
 
         while (
             enabled &&
@@ -2500,7 +2527,7 @@ function scrollToNextQuestion(currentElement) {
         }
     }
 
-    if (next) {http://127.0.0.1:8000
+    if (next) {
         next.scrollIntoView({
             behavior: scrollBehavior(),
             block: "center"

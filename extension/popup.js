@@ -73,6 +73,7 @@ async function init() {
 }
 
 // The popup talks directly to the page you are looking at.
+
 async function sendToActiveTab(payload) {
     const [tab] = await chrome.tabs.query({
         active: true,
@@ -80,17 +81,24 @@ async function sendToActiveTab(payload) {
     });
 
     if (!tab || tab.id === undefined) {
-        throw new Error("No active page was found.");
+        throw new Error("No active tab was found.");
     }
 
     try {
         return await chrome.tabs.sendMessage(tab.id, payload);
     } catch (error) {
+        console.error("Content script communication failed:", {
+            tabUrl: tab.url,
+            messageType: payload?.type,
+            error: error?.message
+        });
+
         throw new Error(
             "This page is not ready. Refresh the page, then press Start."
         );
     }
 }
+
 
 function readAutomationSettings() {
     const speed = ALLOWED_SPEEDS.includes(speedSelect.value)
@@ -141,19 +149,43 @@ async function loadSubjects() {
     }
 }
 
+// Updates the status pill (dot + text) in the popup header.
+function setBackendStatus(text, state, detail = "") {
+    const label = backendStatus.querySelector(".status-text");
+
+    if (label) {
+        label.textContent = text;
+    } else {
+        backendStatus.textContent = text;
+    }
+
+    backendStatus.classList.remove("ok", "error");
+
+    if (state) {
+        backendStatus.classList.add(state);
+    }
+
+    // Hover the pill to see the technical reason.
+    backendStatus.title = detail;
+}
+
 async function checkBackend() {
     try {
         const response = await chrome.runtime.sendMessage({
             type: "PING_BACKEND"
         });
 
-        backendStatus.textContent = response?.ok
-            ? "Backend: Connected"
-            : `Backend: Disconnected${response?.error
-                ? ` — ${response.error}`
-                : ""}`;
+        if (response?.ok) {
+            setBackendStatus("Connected", "ok");
+        } else {
+            setBackendStatus(
+                "Disconnected",
+                "error",
+                response?.error || ""
+            );
+        }
     } catch (error) {
-        backendStatus.textContent = "Backend: Disconnected";
+        setBackendStatus("Disconnected", "error", error.message);
     }
 }
 

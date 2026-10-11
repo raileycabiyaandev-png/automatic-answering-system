@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Question Answer Assistant",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Detects questions and displays matching answers on approved practice pages.",
   "permissions": [
     "storage"
@@ -22,9 +22,7 @@
     {
       "matches": [
         "http://localhost/*",
-        "http://127.0.0.1/*",
-        "https://your-practice-site.com/*",
-        "https://*.your-practice-site.com/*"
+        "http://127.0.0.1/*"
       ],
       "js": [
         "content.js"
