@@ -1,102 +1,46 @@
 // extension/background.js
 "use strict";
 
-// URL of your local FastAPI backend.
+// URL of your FastAPI backend (hosted on Render).
 const API_BASE = "https://automatic-answering-system.onrender.com";
+
+// Render's free plan puts the server to sleep. The first request
+// after a sleep can take about a minute. Chrome stops an extension
+// background script when ONE web request takes longer than 30
+// seconds, so each try waits at most 25 seconds and then tries
+// again. The server keeps waking up between the tries.
+const REQUEST_TIMEOUT_MS = 25000;
+const MAX_ATTEMPTS = 4;
+const RETRYABLE_STATUS = new Set([408, 425, 429, 500, 502, 503, 504]);
 
 
 chrome.runtime.onMessage.addListener(
     (message, sender, sendResponse) => {
 
         if (message?.type === "GET_SUBJECTS") {
-            getSubjects()
-                .then((subjects) => {
-                    sendResponse({
-                        ok: true,
-                        subjects
-                    });
-                })
-                .catch((error) => {
-                    sendResponse({
-                        ok: false,
-                        error: error.message
-                    });
-                });
-
+            reply(getSubjects(), "subjects", sendResponse);
             return true;
         }
 
         if (message?.type === "MATCH_QUESTION") {
-            matchQuestion(message.payload)
-                .then((result) => {
-                    sendResponse({
-                        ok: true,
-                        result
-                    });
-                })
-                .catch((error) => {
-                    sendResponse({
-                        ok: false,
-                        error: error.message
-                    });
-                });
-
+            reply(matchQuestion(message.payload), "result", sendResponse);
             return true;
         }
 
         // Request an AI-generated study suggestion (ONE question).
         if (message?.type === "STUDY_HELP") {
-            getStudyHelp(message.payload)
-                .then((result) => {
-                    sendResponse({
-                        ok: true,
-                        result
-                    });
-                })
-                .catch((error) => {
-                    sendResponse({
-                        ok: false,
-                        error: error.message
-                    });
-                });
-
+            reply(getStudyHelp(message.payload), "result", sendResponse);
             return true;
         }
 
-        // NEW: request AI suggestions for MANY questions at once.
+        // Request AI suggestions for MANY questions at once.
         if (message?.type === "STUDY_HELP_BATCH") {
-            getStudyHelpBatch(message.payload)
-                .then((result) => {
-                    sendResponse({
-                        ok: true,
-                        result
-                    });
-                })
-                .catch((error) => {
-                    sendResponse({
-                        ok: false,
-                        error: error.message
-                    });
-                });
-
+            reply(getStudyHelpBatch(message.payload), "result", sendResponse);
             return true;
         }
 
         if (message?.type === "PING_BACKEND") {
-            requestJson("/health")
-                .then((data) => {
-                    sendResponse({
-                        ok: true,
-                        data
-                    });
-                })
-                .catch((error) => {
-                    sendResponse({
-                        ok: false,
-                        error: error.message
-                    });
-                });
-
+            reply(requestJson("/health"), "data", sendResponse);
             return true;
         }
 
@@ -130,46 +74,130 @@ chrome.runtime.onMessage.addListener(
 );
 
 
-async function requestJson(path, options = {}) {
-    const response = await fetch(
-        `${API_BASE}${path}`,
-        options
-    );
+// Sends { ok: true, [key]: value } or { ok: false, error }.
+function reply(promise, key, sendResponse) {
+    promise
+        .then((value) => {
+            sendResponse({
+                ok: true,
+                [key]: value
+            });
+        })
+        .catch((error) => {
+            sendResponse({
+                ok: false,
+                error: error?.message || String(error)
+            });
+        });
+}
 
-    if (!response.ok) {
-        const body = await response.text();
 
-        let detail = body;
+function sleep(milliseconds) {
+    return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
 
-        try {
-            const parsed = JSON.parse(body);
-            detail = parsed.detail || body;
-        } catch {
-            // Keep the original response text.
+
+async function buildHttpError(response) {
+    const body = await response.text();
+
+    let detail = body;
+
+    try {
+        const parsed = JSON.parse(body);
+        detail = parsed.detail || body;
+
+        if (typeof detail !== "string") {
+            detail = JSON.stringify(detail);
         }
-
-        throw new Error(
-            `Request failed (${response.status}): ${String(detail).slice(0, 400)}`
-        );
+    } catch {
+        // Keep the original response text.
     }
 
-    return response.json();
+    const error = new Error(
+        `Request failed (${response.status}): ${String(detail).slice(0, 400)}`
+    );
+
+    error.status = response.status;
+
+    return error;
+}
+
+
+// Calls the backend. Tries up to 4 times when the server is
+// waking up, busy, or the network drops for a moment.
+async function requestJson(path, options = {}) {
+    // Keeps Chrome from stopping this background script while we
+    // wait for a slow server.
+    const keepAlive = setInterval(() => {
+        try {
+            chrome.runtime.getPlatformInfo(() => {});
+        } catch {
+            // Not important.
+        }
+    }, 20000);
+
+    let lastError = null;
+
+    try {
+        for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+            const controller = new AbortController();
+
+            const timer = setTimeout(
+                () => controller.abort(),
+                REQUEST_TIMEOUT_MS
+            );
+
+            try {
+                const response = await fetch(
+                    `${API_BASE}${path}`,
+                    {
+                        ...options,
+                        signal: controller.signal
+                    }
+                );
+
+                if (response.ok) {
+                    return await response.json();
+                }
+
+                throw await buildHttpError(response);
+
+            } catch (error) {
+                const timedOut = error?.name === "AbortError";
+
+                lastError = timedOut
+                    ? new Error(
+                        "The backend is slow to respond. " +
+                        "It may still be waking up."
+                    )
+                    : error;
+
+                // TypeError = network problem ("Failed to fetch").
+                const retryable =
+                    timedOut ||
+                    error instanceof TypeError ||
+                    RETRYABLE_STATUS.has(error?.status);
+
+                if (!retryable || attempt === MAX_ATTEMPTS) {
+                    throw lastError;
+                }
+
+                await sleep(1000 * attempt);
+
+            } finally {
+                clearTimeout(timer);
+            }
+        }
+    } finally {
+        clearInterval(keepAlive);
+    }
+
+    throw lastError || new Error("Request failed.");
 }
 
 
 async function getSubjects() {
     return requestJson("/subjects");
-}
-
-
-async function matchQuestion(payload) {
-    return requestJson("/match", {
-        method: "POST",
-        headers: {
-            "Content-Type": "application/json"
-        },
-        body: JSON.stringify(payload)
-    });
 }
 
 
@@ -179,6 +207,31 @@ function cleanChoices(choices) {
             .filter((choice) => typeof choice === "string")
             .slice(0, 20)
         : [];
+}
+
+
+async function matchQuestion(payload) {
+    if (
+        !payload ||
+        typeof payload.subject !== "string" ||
+        typeof payload.question !== "string"
+    ) {
+        throw new Error(
+            "The subject or question is missing."
+        );
+    }
+
+    return requestJson("/match", {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+            subject: payload.subject,
+            question: payload.question,
+            choices: cleanChoices(payload.choices)
+        })
+    });
 }
 
 
@@ -233,6 +286,12 @@ async function getStudyHelpBatch(payload) {
             question: item.question,
             choices: cleanChoices(item.choices)
         }));
+
+    if (items.length === 0) {
+        throw new Error(
+            "None of the questions could be sent."
+        );
+    }
 
     return requestJson("/study-help-batch", {
         method: "POST",

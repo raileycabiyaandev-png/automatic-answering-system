@@ -15,7 +15,8 @@ console.log(
 const ALLOWED_HOSTS = [
     "localhost",
     "127.0.0.1",
-    "https://semestral.amaes.com"
+    "automatic-answering-system.onrender.com",
+    "https://semestral.amaes.com",
 ];
 
 let enabled = false;
@@ -98,6 +99,78 @@ let incompleteRetries = 0;
 
 const OVERLAY_ID = "qa-assistant-overlay";
 
+// When a lookup fails (backend asleep, AI busy, network problem)
+// the same question is tried again a few times, with a short
+// pause that grows each time.
+const MAX_LOOKUP_RETRIES = 4;
+const RETRY_BASE_DELAY_MS = 1500;
+const failureCounts = new Map();
+let retryTimer = null;
+const runnerFailures = new WeakMap();
+let applySkipCount = 0;
+
+// The backend (Render free plan) can need about a minute to wake up.
+// The background script retries during that time, so we wait longer.
+const BACKGROUND_TIMEOUT_MS = 150000;
+
+
+// Send a message to background.js. Never waits forever and gives a
+// clear message if the extension was reloaded.
+function sendToBackground(message, timeoutMs = BACKGROUND_TIMEOUT_MS) {
+    return new Promise((resolve, reject) => {
+        let finished = false;
+
+        const timer = setTimeout(() => {
+            if (finished) {
+                return;
+            }
+
+            finished = true;
+            reject(new Error(
+                "The extension took too long to respond."
+            ));
+        }, timeoutMs);
+
+        const fail = (error) => {
+            if (finished) {
+                return;
+            }
+
+            finished = true;
+            clearTimeout(timer);
+
+            const text = String(error?.message || error || "");
+
+            reject(new Error(
+                /context invalidated/i.test(text)
+                    ? "The extension was reloaded. Refresh this page."
+                    : text || "The extension could not be reached."
+            ));
+        };
+
+        try {
+            chrome.runtime.sendMessage(message, (response) => {
+                if (finished) {
+                    return;
+                }
+
+                const lastError = chrome.runtime.lastError;
+
+                if (lastError) {
+                    fail(lastError);
+                    return;
+                }
+
+                finished = true;
+                clearTimeout(timer);
+                resolve(response);
+            });
+        } catch (error) {
+            fail(error);
+        }
+    });
+}
+
 // Containers that hold exactly ONE question.
 const SPECIFIC_QUESTION_SELECTOR =
     "fieldset, [role='radiogroup'], [data-question], " +
@@ -173,6 +246,12 @@ function startAssistant(settings) {
     answerTimer = null;
     followUpTimer = null;
 
+    clearTimeout(retryTimer);
+    retryTimer = null;
+    failureCounts.clear();
+    resolutions.clear();
+    applySkipCount = 0;
+
     answeredElements = new WeakSet();
     lastQuestionKey = "";
     lastDisplayedKey = "";
@@ -180,6 +259,9 @@ function startAssistant(settings) {
     incompleteRetries = 0;
 
     enabled = true;
+
+    // Wake the backend up right away (it may be asleep).
+    sendToBackground({ type: "PING_BACKEND" }).catch(() => {});
 
     showOverlay(
         "Assistant started.\nLooking for questions...",
@@ -199,9 +281,11 @@ function stopAssistant() {
     clearTimeout(answerTimer);
     clearTimeout(followUpTimer);
     clearTimeout(scrollTimer);
+    clearTimeout(retryTimer);
 
     answerTimer = null;
     followUpTimer = null;
+    retryTimer = null;
 
     showOverlay("Assistant paused.", "info");
 }
@@ -410,81 +494,133 @@ async function detectCurrentQuestion() {
     requestInProgress = true;
 
     try {
-        // First, try the existing database and local matcher.
-        const response = await chrome.runtime.sendMessage({
-            type: "MATCH_QUESTION",
-            payload: {
-                subject,
-                question: candidate.question,
-                choices: candidate.choices
-            }
-        });
-
-        if (!response || !response.ok) {
-            throw new Error(
-                response?.error || "Database matching failed."
-            );
-        }
-
-        // The user pressed Stop while we were waiting.
-        if (!enabled) {
-            return;
-        }
-
-        const match = response.result;
-
-        if (!match) {
-            throw new Error(
-                "The backend returned no matching result."
-            );
-        }
-
-        // The existing matcher found a reliable result.
-        if (match.matched) {
-            displayMatchResult(candidate, match);
-            return;
-        }
-
-        // A wrong subject selection should be fixed by the user.
-        if (match.match_type === "subject_not_found") {
-            showOverlay(
-                [
-                    "SUBJECT NOT FOUND",
-                    `Selected subject: ${subject}`,
-                    "",
-                    "Choose a valid subject in the extension popup.",
-                    "No AI request was made."
-                ].join("\n"),
-                "warning"
-            );
-            return;
-        }
-
-        // No reliable database/local match: try Gemini.
-        await requestStudyHelp(candidate);
-
+        await lookupAndShow(candidate);
+        failureCounts.delete(questionKey);
     } catch (error) {
-        console.error(
-            "Question matching failed:",
-            error
-        );
+        handleLookupFailure(candidate, questionKey, error);
+    } finally {
+        requestInProgress = false;
+    }
 
+    // The page may have moved to another question while we were
+    // waiting for the backend. Look again (does nothing if the
+    // question is still the same one).
+    if (enabled) {
+        scheduleDetection();
+    }
+}
+
+
+// Database first, then Gemini. Throws when no answer could be
+// obtained, so the caller can try again.
+async function lookupAndShow(candidate) {
+    const response = await sendToBackground({
+        type: "MATCH_QUESTION",
+        payload: {
+            subject,
+            question: candidate.question,
+            choices: candidate.choices
+        }
+    });
+
+    if (!response || !response.ok) {
+        throw new Error(
+            response?.error || "Database matching failed."
+        );
+    }
+
+    // The user pressed Stop while we were waiting.
+    if (!enabled) {
+        return;
+    }
+
+    const match = response.result;
+
+    if (!match) {
+        throw new Error(
+            "The backend returned no matching result."
+        );
+    }
+
+    // The existing matcher found a reliable result.
+    if (match.matched) {
+        displayMatchResult(candidate, match);
+        return;
+    }
+
+    // A wrong subject selection should be fixed by the user.
+    if (match.match_type === "subject_not_found") {
+        showOverlay(
+            [
+                "SUBJECT NOT FOUND",
+                `Selected subject: ${subject}`,
+                "",
+                "Choose a valid subject in the extension popup.",
+                "No AI request was made."
+            ].join("\n"),
+            "warning"
+        );
+        return;
+    }
+
+    // No reliable database/local match: try Gemini.
+    await requestStudyHelp(candidate);
+}
+
+
+// A lookup failed. Try the same question again after a pause.
+function handleLookupFailure(candidate, questionKey, error) {
+    console.error("Question lookup failed:", error);
+
+    if (!enabled) {
+        return;
+    }
+
+    const tries = (failureCounts.get(questionKey) || 0) + 1;
+    failureCounts.set(questionKey, tries);
+
+    if (tries > MAX_LOOKUP_RETRIES) {
         showOverlay(
             [
                 "QUESTION DETECTED",
                 candidate.question,
                 "",
-                "Could not complete database matching.",
+                "Could not get an answer after several tries.",
                 error.message,
                 "",
-                "Check that the backend is running."
+                "Press Start in the popup to try again."
             ].join("\n"),
             "error"
         );
-
-    } finally {
-        requestInProgress = false;
+        return;
     }
+
+    const delay = RETRY_BASE_DELAY_MS * tries;
+
+    showOverlay(
+        [
+            "QUESTION DETECTED",
+            candidate.question,
+            "",
+            `Could not get an answer yet (try ${tries} of ${MAX_LOOKUP_RETRIES}).`,
+            error.message,
+            "",
+            `Trying again in ${Math.round(delay / 1000)} seconds...`
+        ].join("\n"),
+        "warning"
+    );
+
+    clearTimeout(retryTimer);
+
+    retryTimer = setTimeout(() => {
+        retryTimer = null;
+
+        // Only retry if the page still shows this same question.
+        if (enabled && lastQuestionKey === questionKey) {
+            lastQuestionKey = "";
+            scheduleDetection();
+        }
+    }, delay);
 }
 
 
@@ -596,6 +732,7 @@ function findChoiceForAnswer(answer, choices) {
 
 
 // Request Gemini only after an unsuccessful match.
+// Throws when Gemini cannot answer, so the caller can try again.
 async function requestStudyHelp(candidate) {
     showOverlay(
         [
@@ -608,47 +745,34 @@ async function requestStudyHelp(candidate) {
         "info"
     );
 
-    try {
-        const response = await chrome.runtime.sendMessage({
-            type: "STUDY_HELP",
-            payload: {
-                subject,
-                question: candidate.question,
-                // Gemini also sees the choices.
-                choices: candidate.choices
-            }
-        });
-
-        if (!response || !response.ok) {
-            throw new Error(
-                response?.error || "The AI request failed."
-            );
+    const response = await sendToBackground({
+        type: "STUDY_HELP",
+        payload: {
+            subject,
+            question: candidate.question,
+            // Gemini also sees the choices.
+            choices: candidate.choices
         }
+    });
 
-        displayStudyHelpResult(
-            candidate,
-            response.result
-        );
-
-    } catch (error) {
-        console.error(
-            "Gemini fallback failed:",
-            error
-        );
-
-        showOverlay(
-            [
-                "NO RELIABLE DATABASE MATCH",
-                candidate.question,
-                "",
-                "The AI backup could not provide a result.",
-                error.message,
-                "",
-                "Check the backend terminal and Gemini availability."
-            ].join("\n"),
-            "warning"
+    if (!response || !response.ok) {
+        throw new Error(
+            response?.error || "The AI request failed."
         );
     }
+
+    if (!enabled) {
+        return;
+    }
+
+    if (!validAiResult(response.result)) {
+        throw new Error("Gemini did not return an answer.");
+    }
+
+    displayStudyHelpResult(
+        candidate,
+        response.result
+    );
 }
 
 
@@ -1372,7 +1496,7 @@ async function withRequestSlot(task) {
 
 // Ask the database (fast).
 async function lookupDatabase(candidate) {
-    const response = await chrome.runtime.sendMessage({
+    const response = await sendToBackground({
         type: "MATCH_QUESTION",
         payload: {
             subject,
@@ -1400,7 +1524,7 @@ async function lookupDatabase(candidate) {
 // Send a message. If the AI service is busy, try again quickly.
 async function sendWithRetry(message) {
     for (let attempt = 0; attempt < 3; attempt++) {
-        const response = await chrome.runtime.sendMessage(message);
+        const response = await sendToBackground(message);
 
         if (response && response.ok) {
             return response;
@@ -1768,6 +1892,33 @@ async function startRunner() {
                 break;
             }
 
+            // A failed lookup (backend asleep, AI busy) is tried
+            // again a few times before the question is skipped.
+            if (resolution.kind === "error") {
+                const failures =
+                    (runnerFailures.get(target.element) || 0) + 1;
+
+                runnerFailures.set(target.element, failures);
+
+                if (failures <= MAX_LOOKUP_RETRIES) {
+                    showOverlay(
+                        [
+                            `QUESTION ${number} OF ${total}`,
+                            target.question,
+                            "",
+                            `Could not get an answer yet (try ${failures} of ${MAX_LOOKUP_RETRIES}).`,
+                            resolution.error || "",
+                            "",
+                            "Trying again..."
+                        ].join("\n"),
+                        "warning"
+                    );
+
+                    await sleep(RETRY_BASE_DELAY_MS * failures);
+                    continue;
+                }
+            }
+
             // Mark it as done first, so a problem can never
             // make the extension repeat the same question forever.
             answeredElements.add(target.element);
@@ -2006,12 +2157,28 @@ function applyAnswer(candidate, answer, result) {
     // Do not apply an old answer to a different question.
     // We also use the NEWEST copy of the question, because the
     // page may have rebuilt its elements during the delay.
-    const latest = findBestQuestionCandidate();
+    const wanted = normalize(candidate.question);
+    let latest = null;
 
-    if (
-        !latest ||
-        normalize(latest.question) !== normalize(candidate.question)
-    ) {
+    // First look at the same part of the page again.
+    if (candidate.element.isConnected) {
+        const rebuilt = buildCandidate(candidate.element);
+
+        if (rebuilt && normalize(rebuilt.question) === wanted) {
+            latest = rebuilt;
+        }
+    }
+
+    // The page may have re-drawn itself: search the page again.
+    if (!latest) {
+        const best = findBestQuestionCandidate();
+
+        if (best && normalize(best.question) === wanted) {
+            latest = best;
+        }
+    }
+
+    if (!latest) {
         showOverlay(
             [
                 "ANSWER SKIPPED",
@@ -2021,8 +2188,19 @@ function applyAnswer(candidate, answer, result) {
             ].join("\n"),
             "warning"
         );
+
+        // Look at the page again instead of getting stuck.
+        applySkipCount++;
+
+        if (applySkipCount <= 3) {
+            lastQuestionKey = "";
+            scheduleDetection();
+        }
+
         return;
     }
+
+    applySkipCount = 0;
 
     const actionResult = performAnswer(latest, answer, result);
 
@@ -2155,31 +2333,54 @@ function scheduleNextQuestion(currentElement) {
 }
 
 
+function isDisabledElement(element) {
+    return (
+        element.disabled === true ||
+        element.hasAttribute("disabled") ||
+        element.getAttribute("aria-disabled") === "true"
+    );
+}
+
+
 // Find the "Next Question" button on the practice page.
 function findNextButton() {
     // Your practice page's own button.
-    // NOTE: a <button> with no type="" counts as "submit" in
-    // browsers, so we do NOT check the type for this one.
     const own = document.querySelector("#next-question");
 
-    if (
-        own instanceof HTMLButtonElement &&
-        !own.disabled &&
-        isVisible(own)
-    ) {
+    if (own && !isDisabledElement(own) && isVisible(own)) {
         return own;
     }
 
-    // Other pages: a plain "Next" button that is not a submit button.
-    const buttons = Array.from(document.querySelectorAll("button"));
+    // Other pages: a button whose whole text is "Next",
+    // "Next Question", "Next Page" or "Continue".
+    // Buttons such as "Submit" or "Finish" are never clicked.
+    const elements = Array.from(
+        document.querySelectorAll(
+            "button, input[type='button'], input[type='submit'], " +
+            "a[role='button'], [role='button']"
+        )
+    );
 
-    return buttons.find((button) =>
-        button.type === "button" &&
-        !button.disabled &&
-        isVisible(button) &&
-        !button.closest(`#${OVERLAY_ID}`) &&
-        /^next( question)?$/i.test(clean(button.textContent))
-    ) || null;
+    return elements.find((element) => {
+        if (
+            element.closest(`#${OVERLAY_ID}`) ||
+            isDisabledElement(element) ||
+            !isVisible(element)
+        ) {
+            return false;
+        }
+
+        const raw = element instanceof HTMLInputElement
+            ? element.value
+            : element.textContent;
+
+        const label = clean(raw || "").replace(
+            /\s*[>\u00BB\u2192\u203A]+\s*$/,
+            ""
+        );
+
+        return /^(next|next question|next page|continue)$/i.test(label);
+    }) || null;
 }
 
 
@@ -2260,6 +2461,15 @@ function selectMatchingChoice(candidate, answer, result) {
                     );
                 });
             }
+
+            // Last resort: the choice that shares the most words
+            // with the answer (only when there is one clear winner).
+            if (choiceIndex === -1) {
+                choiceIndex = bestWordOverlapChoice(
+                    normalizedAnswer,
+                    choices
+                );
+            }
         }
     }
 
@@ -2294,7 +2504,9 @@ function selectMatchingChoice(candidate, answer, result) {
             input.click();
         }
 
-        if (!input.checked) {
+        // If the page re-drew the radio button, the old one is no
+        // longer on the page. That is not a failure.
+        if (!input.checked && input.isConnected) {
             return null;
         }
 
@@ -2314,6 +2526,54 @@ function selectMatchingChoice(candidate, answer, result) {
     }
 
     return null;
+}
+
+
+function bestWordOverlapChoice(normalizedAnswer, choices) {
+    const toWords = (text) =>
+        new Set(
+            normalize(text)
+                .split(" ")
+                .filter((word) => word.length > 2)
+        );
+
+    const answerWords = toWords(normalizedAnswer);
+
+    if (answerWords.size === 0) {
+        return -1;
+    }
+
+    let bestIndex = -1;
+    let bestScore = 0;
+    let tie = false;
+
+    choices.forEach((choice, index) => {
+        const words = toWords(stripChoicePrefix(choice));
+
+        if (words.size === 0) {
+            return;
+        }
+
+        let shared = 0;
+
+        for (const word of words) {
+            if (answerWords.has(word)) {
+                shared++;
+            }
+        }
+
+        const score = shared / Math.max(words.size, answerWords.size);
+
+        if (score > bestScore) {
+            bestScore = score;
+            bestIndex = index;
+            tie = false;
+        } else if (score === bestScore && score > 0) {
+            tie = true;
+        }
+    });
+
+    return bestScore >= 0.6 && !tie ? bestIndex : -1;
 }
 
 

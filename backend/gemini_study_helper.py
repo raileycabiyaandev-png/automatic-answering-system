@@ -3,12 +3,28 @@ import json
 import os
 import re
 import threading
+import time
 
 from google import genai
 from google.genai import types
 
 
-MODEL_NAME = "gemini-3.5-flash-lite"
+# The first model is used normally. If it is busy, out of quota or
+# not available, the next one is tried automatically.
+# You can put your own first choice in the GEMINI_MODEL setting
+# on Render.
+MODEL_NAMES = [
+    name
+    for name in dict.fromkeys(
+        [
+            os.environ.get("GEMINI_MODEL", "").strip(),
+            "gemini-3.5-flash-lite",
+            "gemini-2.5-flash-lite",
+            "gemini-2.5-flash",
+        ]
+    )
+    if name
+]
 
 # Prefix such as "A. ", "b) " or "C: " at the start of a choice.
 _CHOICE_PREFIX = re.compile(r"^\s*[A-Ha-h][.):]\s+")
@@ -42,7 +58,15 @@ def _get_client():
 
     with _client_lock:
         if _client is None:
-            _client = genai.Client(api_key=api_key)
+            try:
+                # Give up on a stuck Gemini call after 20 seconds,
+                # so the extension is not left waiting.
+                _client = genai.Client(
+                    api_key=api_key,
+                    http_options=types.HttpOptions(timeout=20000),
+                )
+            except Exception:
+                _client = genai.Client(api_key=api_key)
 
         return _client
 
@@ -74,46 +98,95 @@ def _config_variants(max_tokens: int, json_mode: bool = False) -> list:
     return variants
 
 
-def _is_config_error(exc: Exception) -> bool:
+def _error_code(exc: Exception):
     code = getattr(exc, "code", None)
-    return code == 400 or "thinking" in str(exc).lower()
+
+    return code if isinstance(code, int) else None
+
+
+def _is_config_error(exc: Exception) -> bool:
+    return _error_code(exc) == 400 or "thinking" in str(exc).lower()
+
+
+def _is_busy_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+
+    return (
+        _error_code(exc) in (429, 500, 502, 503, 504)
+        or "unavailable" in text
+        or "overloaded" in text
+        or "timed out" in text
+        or "timeout" in text
+    )
+
+
+def _call_model(client, model: str, prompt: str, config):
+    """One Gemini call. A busy server is tried once more."""
+    for attempt in range(2):
+        try:
+            return client.models.generate_content(
+                model=model,
+                contents=prompt,
+                config=config,
+            )
+        except Exception as exc:
+            if (
+                attempt == 0
+                and _is_busy_error(exc)
+                and not _is_config_error(exc)
+            ):
+                time.sleep(0.8)
+                continue
+
+            raise
 
 
 def _generate(client, prompt: str, max_tokens: int, json_mode: bool = False):
-    """Call Gemini with the fastest config that the model accepts."""
+    """
+    Call Gemini with the fastest config that the model accepts.
+    If a model is busy, out of quota or missing, the next model in
+    MODEL_NAMES is used.
+    """
     global _variant_index
 
-    variants = _config_variants(max_tokens, json_mode)
     last_error = None
 
-    start = min(_variant_index, len(variants) - 1)
+    for model in MODEL_NAMES:
+        variants = _config_variants(max_tokens, json_mode)
 
-    for i in range(start, len(variants)):
-        try:
-            response = client.models.generate_content(
-                model=MODEL_NAME,
-                contents=prompt,
-                config=variants[i],
-            )
-        except Exception as exc:
-            if not _is_config_error(exc):
-                raise
+        start = min(_variant_index, len(variants) - 1)
 
-            last_error = exc
-            _variant_index = i + 1
-            continue
+        for i in range(start, len(variants)):
+            try:
+                response = _call_model(client, model, prompt, variants[i])
+            except Exception as exc:
+                last_error = exc
 
-        text = (response.text or "").strip()
+                if _is_config_error(exc):
+                    # This setting does not suit the model.
+                    _variant_index = i + 1
+                    continue
 
-        # Empty text with a small limit means this config does not
-        # suit the model. Move on to the next one.
-        if not text and i < len(variants) - 1:
-            last_error = RuntimeError("Gemini returned an empty answer.")
-            _variant_index = i + 1
-            continue
+                # Busy, out of quota or model not found:
+                # try the next model.
+                print(
+                    f"Gemini model {model} failed:",
+                    type(exc).__name__,
+                    getattr(exc, "code", "no code"),
+                )
+                break
 
-        _variant_index = i
-        return response
+            text = (response.text or "").strip()
+
+            # Empty text with a small limit means this config does not
+            # suit the model. Move on to the next one.
+            if not text and i < len(variants) - 1:
+                last_error = RuntimeError("Gemini returned an empty answer.")
+                _variant_index = i + 1
+                continue
+
+            _variant_index = i
+            return response
 
     raise last_error or RuntimeError("Gemini request failed.")
 
@@ -157,10 +230,10 @@ _DISCLAIMER = (
 def _choice_result(choices: list[str], raw: str) -> dict:
     valid = _LETTERS[: len(choices)]
 
-    match = re.match(r"^\W*([A-Za-z])\b", raw)
+    match = re.match(r"^\W*([A-Za-z])\s*(?:[.):]|$)", raw)
 
     if not match or match.group(1).upper() not in valid:
-        match = re.search(r"\b([A-Za-z])\b", raw)
+        match = re.search(r"\b([A-T])\b", raw)
 
     letter = match.group(1).upper() if match else None
 

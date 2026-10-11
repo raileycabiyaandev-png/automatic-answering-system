@@ -1,26 +1,57 @@
 // extension/popup.js
 "use strict";
 
-const subjectSelect = document.getElementById("subject");
-const backendStatus = document.getElementById("backendStatus");
-const message = document.getElementById("message");
-const startButton = document.getElementById("start");
-const stopButton = document.getElementById("stop");
+const $ = (id) => document.getElementById(id);
 
-const autoAnswerToggle = document.getElementById("autoAnswer");
-const autoScrollToggle = document.getElementById("autoScroll");
-const speedSelect = document.getElementById("answerSpeed");
+const subjectSelect = $("subject");
+const backendStatus = $("backendStatus");
+const message = $("message");
+const startButton = $("start");
+const stopButton = $("stop");
+
+const autoAnswerToggle = $("autoAnswer");
+const autoScrollToggle = $("autoScroll");
+const speedSelect = $("answerSpeed");
 
 const ALLOWED_SPEEDS = ["0", "0.25", "0.5", "1", "2", "3", "5"];
 const DEFAULT_SPEED = "0";
 
+// Tell the developer (in the popup's console) if an element that
+// popup.html should have is missing, instead of crashing.
+for (const [id, element] of Object.entries({
+    subject: subjectSelect,
+    backendStatus,
+    message,
+    start: startButton,
+    stop: stopButton,
+    autoAnswer: autoAnswerToggle,
+    autoScroll: autoScrollToggle,
+    answerSpeed: speedSelect
+})) {
+    if (!element) {
+        console.warn(`popup.html has no element with id="${id}"`);
+    }
+}
+
+function setMessage(text) {
+    if (message) {
+        message.textContent = text;
+    }
+}
+
+function on(element, type, handler) {
+    if (element) {
+        element.addEventListener(type, handler);
+    }
+}
+
 init();
 
-startButton.addEventListener("click", async () => {
-    const subject = subjectSelect.value;
+on(startButton, "click", async () => {
+    const subject = subjectSelect ? subjectSelect.value : "";
 
     if (!subject) {
-        message.textContent = "Select a subject first.";
+        setMessage("Select a subject first.");
         return;
     }
 
@@ -40,35 +71,43 @@ startButton.addEventListener("click", async () => {
         });
 
         if (!response?.ok) {
-            message.textContent =
-                response?.error || "Could not start on this page.";
+            setMessage(
+                response?.error || "Could not start on this page."
+            );
             return;
         }
 
-        message.textContent = settings.autoAnswer
-            ? "Started on this page. Auto-answer is ON."
-            : "Started on this page. Watching for questions.";
+        setMessage(
+            settings.autoAnswer
+                ? "Started on this page. Auto-answer is ON."
+                : "Started on this page. Watching for questions."
+        );
     } catch (error) {
-        message.textContent = error.message;
+        setMessage(error.message);
     }
 });
 
-stopButton.addEventListener("click", async () => {
+on(stopButton, "click", async () => {
     try {
         await sendToActiveTab({ type: "QAA_STOP" });
-        message.textContent = "Stopped on this page.";
+        setMessage("Stopped on this page.");
     } catch (error) {
-        message.textContent = error.message;
+        setMessage(error.message);
     }
 });
 
-autoAnswerToggle.addEventListener("change", saveAutomationSettings);
-autoScrollToggle.addEventListener("change", saveAutomationSettings);
-speedSelect.addEventListener("change", saveAutomationSettings);
+on(autoAnswerToggle, "change", saveAutomationSettings);
+on(autoScrollToggle, "change", saveAutomationSettings);
+on(speedSelect, "change", saveAutomationSettings);
 
 async function init() {
-    await loadSubjects();
-    await checkBackend();
+    // Check the backend and load the subjects at the SAME time.
+    // (If the server was asleep, it starts waking up right away.)
+    await Promise.all([
+        loadSubjects(),
+        checkBackend()
+    ]);
+
     await restoreState();
 }
 
@@ -101,13 +140,15 @@ async function sendToActiveTab(payload) {
 
 
 function readAutomationSettings() {
-    const speed = ALLOWED_SPEEDS.includes(speedSelect.value)
-        ? Number(speedSelect.value)
+    const speedValue = speedSelect ? speedSelect.value : DEFAULT_SPEED;
+
+    const speed = ALLOWED_SPEEDS.includes(speedValue)
+        ? Number(speedValue)
         : Number(DEFAULT_SPEED);
 
     return {
-        autoAnswer: autoAnswerToggle.checked,
-        autoScroll: autoScrollToggle.checked,
+        autoAnswer: Boolean(autoAnswerToggle && autoAnswerToggle.checked),
+        autoScroll: Boolean(autoScrollToggle && autoScrollToggle.checked),
         answerSpeed: speed
     };
 }
@@ -115,14 +156,20 @@ function readAutomationSettings() {
 async function saveAutomationSettings() {
     try {
         await chrome.storage.local.set(readAutomationSettings());
-        message.textContent = "Settings saved.";
+        setMessage("Settings saved.");
     } catch (error) {
-        message.textContent =
-            `Could not save settings: ${error.message}`;
+        setMessage(`Could not save settings: ${error.message}`);
     }
 }
 
 async function loadSubjects() {
+    if (!subjectSelect) {
+        return;
+    }
+
+    subjectSelect.innerHTML =
+        "<option value=''>Loading subjects...</option>";
+
     try {
         const response = await chrome.runtime.sendMessage({
             type: "GET_SUBJECTS"
@@ -131,6 +178,10 @@ async function loadSubjects() {
         if (!response?.ok) {
             subjectSelect.innerHTML =
                 "<option value=''>Backend unavailable</option>";
+            setMessage(
+                response?.error ||
+                "Could not load the subjects. Close and open this popup to try again."
+            );
             return;
         }
 
@@ -151,6 +202,10 @@ async function loadSubjects() {
 
 // Updates the status pill (dot + text) in the popup header.
 function setBackendStatus(text, state, detail = "") {
+    if (!backendStatus) {
+        return;
+    }
+
     const label = backendStatus.querySelector(".status-text");
 
     if (label) {
@@ -170,6 +225,12 @@ function setBackendStatus(text, state, detail = "") {
 }
 
 async function checkBackend() {
+    setBackendStatus(
+        "Connecting...",
+        "",
+        "The server can take up to a minute to wake up."
+    );
+
     try {
         const response = await chrome.runtime.sendMessage({
             type: "PING_BACKEND"
@@ -197,28 +258,38 @@ async function restoreState() {
         "answerSpeed"
     ]);
 
-    if (state.subject) {
+    if (state.subject && subjectSelect) {
         subjectSelect.value = state.subject;
     }
 
-    autoAnswerToggle.checked = Boolean(state.autoAnswer);
-    autoScrollToggle.checked = Boolean(state.autoScroll);
+    if (autoAnswerToggle) {
+        autoAnswerToggle.checked = Boolean(state.autoAnswer);
+    }
 
-    speedSelect.value = ALLOWED_SPEEDS.includes(
-        String(state.answerSpeed)
-    )
-        ? String(state.answerSpeed)
-        : DEFAULT_SPEED;
+    if (autoScrollToggle) {
+        autoScrollToggle.checked = Boolean(state.autoScroll);
+    }
+
+    if (speedSelect) {
+        speedSelect.value = ALLOWED_SPEEDS.includes(
+            String(state.answerSpeed)
+        )
+            ? String(state.answerSpeed)
+            : DEFAULT_SPEED;
+    }
 
     // Ask THIS page whether it is running.
     try {
         const status = await sendToActiveTab({ type: "QAA_STATUS" });
 
-        message.textContent = status?.enabled
-            ? "Running on this page."
-            : "Not running. Press Start.";
+        setMessage(
+            status?.enabled
+                ? "Running on this page."
+                : "Not running. Press Start."
+        );
     } catch (error) {
-        message.textContent =
-            "Not running. Refresh the page if Start does not work.";
+        setMessage(
+            "Not running. Refresh the page if Start does not work."
+        );
     }
 }
