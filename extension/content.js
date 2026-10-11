@@ -1122,9 +1122,14 @@ function sleep(milliseconds) {
 
 
 function isLocalPracticePage() {
+    const host = location.hostname;
+
     return (
-        ["localhost", "127.0.0.1"].includes(location.hostname) &&
-        ["http:", "https:"].includes(location.protocol)
+        ["http:", "https:"].includes(location.protocol) &&
+        ALLOWED_HOSTS.some(
+            (allowed) =>
+                host === allowed || host.endsWith("." + allowed)
+        )
     );
 }
 
