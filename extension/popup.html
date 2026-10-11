@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Question Answer Assistant</title>
+    <link rel="stylesheet" href="popup.css">
+</head>
+
+<body>
+    <main class="container">
+
+        <header class="header">
+            <h1>Answer Assistant</h1>
+            <div id="backendStatus" class="status" role="status">
+                <span class="dot" aria-hidden="true"></span>
+                <span class="status-text">Checking backend…</span>
+            </div>
+        </header>
+
+        <section class="section">
+            <label class="field-label" for="subject">Subject</label>
+            <select id="subject">
+                <option value="">Loading…</option>
+            </select>
+        </section>
+
+        <section class="section">
+            <h2>Automation</h2>
+
+            <label class="toggle" for="autoAnswer">
+                <span class="toggle-text">
+                    <span class="toggle-title">Auto-answer questions</span>
+                    <span class="toggle-hint">Fills in answers on practice pages</span>
+                </span>
+                <input type="checkbox" id="autoAnswer">
+                <span class="switch" aria-hidden="true"></span>
+            </label>
+
+            <label class="toggle" for="autoScroll">
+                <span class="toggle-text">
+                    <span class="toggle-title">Go to next question</span>
+                    <span class="toggle-hint">Uses the Next button or scrolls</span>
+                </span>
+                <input type="checkbox" id="autoScroll">
+                <span class="switch" aria-hidden="true"></span>
+            </label>
+
+            <div class="field">
+                <label class="field-label" for="answerSpeed">Pause per question</label>
+                <select id="answerSpeed">
+                    <option value="0" selected>Instant</option>
+                    <option value="0.25">0.25 seconds</option>
+                    <option value="0.5">0.5 seconds</option>
+                    <option value="1">1 second</option>
+                    <option value="2">2 seconds</option>
+                    <option value="3">3 seconds</option>
+                    <option value="5">5 seconds</option>
+                </select>
+            </div>
+        </section>
+
+        <div class="buttons">
+            <button id="start" class="primary" type="button">Start</button>
+            <button id="stop" class="secondary" type="button">Stop</button>
+        </div>
+
+        <div id="message" class="message" role="status" aria-live="polite"></div>
+
+        <p class="note">
+            Press Start again after refreshing or opening a new page.
+            Works on localhost and 127.0.0.1 only. Answers are never
+            submitted for you, so review them before you submit.
+        </p>
+    </main>
+
+    <script src="popup.js"></script>
+</body>
+</html>

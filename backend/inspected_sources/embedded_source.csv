@@ -1,0 +1,161 @@
+Load Testing,This is a type of performance testing conducted to evaluate the behavior of a system at increasing workload.
+Performance Testing,This is a type of software testing that intends to determine how a system performs in terms of responsiveness and stability under a certain load.
+Scalability,This determines the maximum user load the software application can handle.
+Spike Testing,This is a type of performance testing conducted to evaluate the behavior of a system when the load is suddenly and substantially increased.
+Speed,This determines whether the application responds quickly.
+Endurance Testing,This is a type of performance testing conducted to evaluate the behavior of a system when a significant workload is given continuously.
+Stability,This determines if the application is stable under varying loads.
+Bottlenecks,The goal of Performance Testing is to eliminate these.
+Stress Testing,This is a type of performance testing conducted to evaluate the behavior of a system at or beyond the limits of its anticipated workload.
+Software Application's Performance,"Its response time, reliability, resource usage, and scalability do matter."
+TRUE,"Performance
+Testing  is a subset of"
+FALSE,"Performance
+Testing cannot uncover what needs to be tested and upgraded before the product goes to the market."
+TRUE,"Without Performance
+Testing, software is likely to suffer from issues such as running slow while
+several users use it simultaneously."
+FALSE,"Application Testing will determine whether their software meets speed, scalability, and
+stability requirements under expected workloads."
+FALSE,"Applications
+sent to market with poor performance metrics due to non-existent or poor
+ are likely to gain popularity and new niche in the market."
+TRUE,"Mission-critical
+applications like space launch programs or life-saving medical equipment should
+be performance tested to ensure that they run for a long period without
+deviations."
+FALSE,"Only a 1-minute downtime of is estimated to cost the search
+giant as much as $545,000."
+TRUE,It is estimated that companies lost sales worth $1100 per second due to a recent
+FALSE,"Scability Testing is to
+check software application's performance under varying database volumes."
+FALSE,"Volume Testing helps
+plan capacity addition to the software system."
+Processor Usage,This refers to an amount of time processor spends executing non-idle threads.
+thread counts,An applications health can be measured by the number of threads that are running and currently active.
+response times,"Proper loading includes goals and constraints for
+throughput, _____________ and resource allocation.  It is also necessary
+to identify project success criteria outside of these goals and
+constraints."
+Throughput,This is the rate of a computer or what the network can receive a request per second.
+Garbage Collection,It has to do with returning unused memory back to the system.
+Hit Ratios,"This has to do with the number ofSQL statements
+that are handled by cached data instead of expensive I/O operations."
+Disk Time,This is an amount of time when the disk is busy executing a read or write request.
+long load time,"This is normally the initial
+time it takes an application to start."
+Memory Use,"This refers to the amount of physical memory available to
+process on a computer."
+Response Time,This referred to the time from when a user enters a request until the first character of the response is received.
+Disk Queue Length,This is the average number of read and write requests queued for the selected disk during a sample interval.
+bottlenecking,"The key to fixing a ________________ issue is to
+find the section of code that is causing the slowdown and try to fix it there."
+Software Enhancement,All are common activities of performance bottlenecks except one.
+Private Bytes,"The number of bytes a process has allocated that
+can't be shared among other processes. These are used to measure memory leaks
+and usage."
+bottlenecking,"This is when either coding
+errors or hardware issues cause a decrease of throughput under certain loads."
+response time,"This should be very quick or else, the user has to wait too long and they lose interest."
+Committed Memory,The refers to the amount of virtual memory used.
+Bandwidth,"This shows the bits per second used by a network
+interface."
+methodology,"This _____________ adopted for  can vary widely but the
+objective for performance tests remain the same."
+network configurations,"The IT expert should understand the details of the hardware, software and _________________ used during testing before  beginning the testing process."
+Top Waits,These are monitored to determine what wait times can be cut down when dealing with the how fast data is retrieved from memory.
+Hard Page Faults,This is when the code that is not from the current working set is called up from elsewhere and retrieved from a disk.
+Memory Pages,"These referred to the number of pages written to or read from the disk in order to resolve
+hard page faults."
+poor scalability,"A  from this  when it cannot handle the expected number of users or when it does not
+accommodate a wide enough range of users."
+security professional,Which of the following statements best describes a white-hat hacker?
+remote attack,Name the attack type when a hacker attempts to attack a host via the Internet.
+authentication,MAC address spoofing is which type of attack?
+target of evaluation,"Which of the following is a system, program, or network that is the subject of a security analysis?"
+TRUE,Hacking for a cause is called hacktivism.
+white-box testing,A security audit performed on the internal network of an organization by the network administration is also known as ______________.
+"as security decreases, functionality and ease of use increase","The security, functionality, and ease of use triangle illustrates which concept?"
+cracker,Who uses their hacking skills for destructive purposes?
+physical access,What type of ethical hack tests access to the physical infrastructure?
+eCommerce,This is a business conducted electronically.
+yes,The Computer Bus transmits data to different parts of the machine.
+operating system,"The _____________ tells the computer how to perform the functions of loading, storing, and executing an application program and how to transfer data."
+hyperlink,"A built-in connection to other documents, graphics, audio files, videos, web pages, or websites."
+Internet,The world's largest network is the:
+TRUE,The control unit is the part of the processor that interprets the instructions.
+CPU,This is the brain of the computer.
+hard drive,"This is a storage device that contains one or more inflexible, circular platters that magnetically store data, instructions, and information."
+mouse,A pointing device that fits comfortably in the palm of your hand.
+keyboard,An input device that contains keys you press to enter data into a computer.
+disgruntled employee,Which type of person poses the greatest threat to an organization's security?
+LR Controller,"In the start menu,click All Program-HP software-HP
+LoaderRunner-Controller to open the ."
+Separate command,"Verify that a  window opens the following
+message"
+Apache Web Server,"If the is not running click start-all
+programs-HP Software-HP LoadRunner-Samples-Web-Start HP Web tours Server."
+Pacing,The time to wait before repeating the action.
+Window Task Bar,"In verify that the Apache web server is running
+."
+Stress testing,"It is performed to find the upper limit capacity of the system and
+also to determine how the system performs if the current load goes well above
+the expected maximum."
+Load testing,It is the simplest form of testing conducted to understand the
+Soak testing,"Also known as endurance testing is performed to determine the
+system parameters under continuous expected load."
+Spike testing,"Performed by increasing the number of users suddenly by a very
+large amount and measuring the performance of the system."
+Performance testing,"Measures the quality attributes of the system, such as
+scalability, reliability and resource usage."
+Standalone Applications,"Enables you to run
+standalone installations of the following applications: Analysis, Load
+Generator, MI Listener, Monitors Over Firewall, and Virtual User Generator
+(VuGen)."
+Content Check,For automatically detecting user-defined errors.
+IDE Add-ins,"Installs a component
+that enables you to create and run scripts, written in your standard
+development environment, in the application's native language."
+Think Time,The time the user stops to think between steps.
+Vusers Quantity,Provide the desired
+Service Test Add-in,"Enables you to run VuGen with all of the HP Service Test
+capabilities."
+SiteScope,"Installs the
+SiteScope server used for the Siebel Web Server, SAP CCMS, SAP Portal, and
+Server Resource monitors"
+Speed Simulation,"Users using different network connections such as
+modem, DSL, and cable."
+Log,"The level of information that you want to gather during
+the test."
+HP Performance Validation SDK,"Provides you with the
+tools to create a custom protocol to run load tests on a previously unsupported
+application."
+Run Logic,The number of times a user repeats a set of actions.
+Change Scenario group name,Select the script and click the
+Browser Emulation,"Users using
+different browsers to see their application’s performance."
+Locate the desired script,"Navigate to find out that that our desired
+script basic script in this case appears in the Group Name column of the
+Scenario Groups pane."
+correct,"APIs should be functionally ____________, as well as available, fast, secure and reliable."
+performance tests,Most API tests also fall under the umbrella term “__________________” because their purpose is to determine the overall performance of a system under specific circumstances.
+functional API tests,______________are the equivalent of unit tests for software.
+developers,"For _____________, API testing is essential not just for making promises to customers (and keeping them) but also for gathering data about API performance to improve development."
+load tests,API performance tests can be divided into two: functional and _______________.
+same results,"When the deployment works, the tests should return the ____________ everywhere."
+API Load Tests,This is because non-functional constraints such as reliability and responsiveness look differently under various real-world conditions.
+virtual users,"Every load test works with _____________, typically abbreviated to VU, which simulate different clients."
+equivalent system,"Load API tests, on the other hand, typically run in production or an ______________."
+functional API tests,It's recommended to run them to verify that deployment doesn't break functionality.
+shorter than,A peak test is typically _____________ a soak test and often includes ramping up and ramping down to a higher pressure but not as huge as within a stress test.
+"testing, monitoring","_____________ is done as part of the development, build and deploy process;  ______________ is done in regular intervals to catch potential problems with the system while it's in production."
+API Monitoring,______________ typically includes simple uptime checks as well as performance or functional tests.
+Soak Testing,"The idea behind ______________ is that sometimes a system seems to perform as expected under a particular load and then, all of a sudden, it stops working without any changes in traffic."
+stress testing,"The idea behind this testing approach is to continuously grow the load to find the point at which your API becomes either too slow, non-responsive or throws errors."
+peak test,hese are the times during which you expect a higher load.
+URL/API Test,To set up an function endpoint test in BlazeMeter you can click the  button under  and enter your API operation endpoints.
+increase,"The idea behind Spike Testing is to _______________ the load in short bursts, much faster than in a peak test, to see how the system performs to sudden increases who flatline again."
+UAT tests,This is testing by the actual users.
+server memory or disk space,"Running out of ______________ due to leaks or not cleaning up logs etc. is a common reason for it. To discover these errors before they happen, you can soak test."
+starts,The ramp-up ___________ with a single user and grows linearly until reaching the selected number of users.
+The correct answer is:,To set up an function endpoint test in BlazeMeter you can click the  button under  and enter your API operation endpoints.

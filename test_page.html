@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Art Appreciation</title>
+    <style>
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        max-width: 900px;
+        margin: 28px auto;
+        padding: 20px;
+        font:
+          16px/1.55 Arial,
+          sans-serif;
+        color: #172033;
+        background: #f8fafc;
+      }
+      .panel,
+      #status {
+        padding: 12px 14px;
+        border: 1px solid #cbd5e1;
+        border-radius: 8px;
+        background: #fff;
+        margin: 16px 0;
+      }
+      #status {
+        background: #e2e8f0;
+      }
+      fieldset.question-card {
+        padding: 22px;
+        margin: 24px 0;
+        border: 1px solid #cbd5e1;
+        border-radius: 10px;
+        background: #fff;
+        min-height: 210px;
+        scroll-margin-top: 20px;
+      }
+      legend {
+        font-weight: bold;
+      }
+      .question-text {
+        font-size: 1.1rem;
+        font-weight: bold;
+      }
+      .choice {
+        display: block;
+        padding: 12px;
+        margin: 10px 0;
+        border: 1px solid #dbe2ea;
+        border-radius: 8px;
+        background: #fff;
+        overflow-wrap: anywhere;
+      }
+      .choice input {
+        margin-right: 8px;
+      }
+      .answer-input {
+        display: block;
+        width: 100%;
+        padding: 12px;
+        margin-top: 12px;
+        border: 1px solid #94a3b8;
+        border-radius: 8px;
+        font-size: 1rem;
+      }
+      .small {
+        font-size: 0.9rem;
+        color: #475569;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Art Appreciation</h1>
+    <div id="status" role="status">
+      Loading Art Appreciation records from the local database…
+    </div>
+    <main id="question-list">
+      <p>Questions will appear here after the database loads.</p>
+    </main>
+    <script>
+      "use strict";
+      const API_BASE = "http://127.0.0.1:8000",
+        SUBJECT = "Art Appreciation";
+      const list = document.getElementById("question-list"),
+        statusBox = document.getElementById("status");
+      function clean(v) {
+        return String(v || "")
+          .replace(/\s+/g, " ")
+          .trim();
+      }
+      function norm(v) {
+        return clean(v)
+          .toLowerCase()
+          .replace(/[^\p{L}\p{N}]+/gu, " ")
+          .trim();
+      }
+      function shuffle(a) {
+        const r = [...a];
+        for (let i = r.length - 1; i > 0; i--) {
+          const j = Math.floor(Math.random() * (i + 1));
+          [r[i], r[j]] = [r[j], r[i]];
+        }
+        return r;
+      }
+      function valid(r) {
+        const q = clean(r.question_text),
+          a = clean(r.answer_text);
+        return (
+          q.length >= 8 &&
+          q.length <= 1000 &&
+          a.length >= 1 &&
+          a.length <= 250 &&
+          norm(q) !== norm(a)
+        );
+      }
+      function makePool(rows) {
+        const seen = new Set(),
+          pool = [];
+        for (const r of rows) {
+          if (!valid(r)) continue;
+          const x = {
+            question: clean(r.question_text),
+            answer: clean(r.answer_text),
+          };
+          const k = norm(x.question) + "|" + norm(x.answer);
+          if (!seen.has(k)) {
+            seen.add(k);
+            pool.push(x);
+          }
+        }
+        return pool;
+      }
+      function makeCard(item, i, kind, pool) {
+        const card = document.createElement("fieldset");
+        card.className = "question-card";
+        const legend = document.createElement("legend");
+        legend.textContent = `Question ${i + 1} — ${kind === "mc" ? "Multiple Choice" : "Identification"}`;
+        card.appendChild(legend);
+        const q = document.createElement("p");
+        q.className = "question-text";
+        q.id = `question-text-${i + 1}`;
+        q.textContent = item.question;
+        card.appendChild(q);
+        if (kind === "mc") {
+          const distractors = [],
+            seen = new Set([norm(item.answer)]);
+          for (const other of shuffle(pool)) {
+            const k = norm(other.answer);
+            if (!k || seen.has(k)) continue;
+            seen.add(k);
+            distractors.push(other.answer);
+            if (distractors.length === 3) break;
+          }
+          shuffle([item.answer, ...distractors]).forEach((txt, j) => {
+            const lab = document.createElement("label");
+            lab.className = "choice";
+            const radio = document.createElement("input");
+            radio.type = "radio";
+            radio.name = `question-${i + 1}`;
+            radio.value = String.fromCharCode(65 + j);
+            lab.appendChild(radio);
+            lab.appendChild(document.createTextNode(` ${radio.value}. ${txt}`));
+            card.appendChild(lab);
+          });
+        } else {
+          const input = document.createElement("input");
+          input.type = "text";
+          input.name = `question-${i + 1}`;
+          input.className = "answer-input";
+          input.placeholder = "Enter your identification answer";
+          input.autocomplete = "off";
+          card.appendChild(input);
+        }
+        return card;
+      }
+      async function load() {
+        try {
+          const res = await fetch(
+            `${API_BASE}/questions?subject=${encodeURIComponent(SUBJECT)}&limit=100`,
+          );
+          if (!res.ok) throw Error(`Backend returned HTTP ${res.status}.`);
+          const pool = makePool(await res.json());
+          if (pool.length < 10)
+            throw Error(
+              `Only ${pool.length} usable records were returned; at least 10 are needed.`,
+            );
+          list.replaceChildren();
+          shuffle(pool)
+            .slice(0, 10)
+            .forEach((item, i) =>
+              list.appendChild(makeCard(item, i, i < 5 ? "mc" : "id", pool)),
+            );
+          statusBox.textContent =
+            "Ready: 10 questions loaded — 5 multiple-choice and 5 identification. Scroll down is the only navigation.";
+        } catch (e) {
+          console.error(e);
+          statusBox.textContent = `Could not load the test: ${e.message} Check that the backend is running and CORS allows localhost:5500.`;
+          list.replaceChildren();
+          const p = document.createElement("p");
+          p.textContent =
+            "Could not load questions. Check the backend and refresh.";
+          list.appendChild(p);
+        }
+      }
+      load();
+    </script>
+  </body>
+</html>

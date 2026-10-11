@@ -1,0 +1,109 @@
+# ==========================================
+# PYTHON VIRTUAL ENVIRONMENTS
+# ==========================================
+.venv/
+venv/
+env/
+ENV/
+
+# ==========================================
+# PYTHON CACHE FILES
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pytype/
+.hypothesis/
+
+# ==========================================
+# ENVIRONMENT VARIABLES AND API KEYS
+# ==========================================
+.env
+.env.*
+!.env.example
+!.env.sample
+
+# Private credentials
+secrets.json
+credentials.json
+token.json
+service-account*.json
+
+# ==========================================
+# DATABASE FILES
+# ==========================================
+*.sqlite
+*.sqlite3
+*.db
+
+# Keep the current question database available
+# for the project demo, if it contains no private data.
+!backend/questions.db
+
+# SQLite temporary and journal files
+*.db-journal
+*.sqlite-journal
+*.sqlite3-journal
+
+# ==========================================
+# LOGS AND TEMPORARY FILES
+# ==========================================
+*.log
+logs/
+tmp/
+temp/
+*.tmp
+*.bak
+*.swp
+*.swo
+
+# ==========================================
+# TESTING AND CODE COVERAGE
+# ==========================================
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+test-results/
+.nox/
+.tox/
+
+# ==========================================
+# PYTHON BUILD FILES
+# ==========================================
+build/
+dist/
+.eggs/
+wheels/
+pip-wheel-metadata/
+*.egg-info/
+
+# ==========================================
+# JAVASCRIPT / CHROME EXTENSION
+# ==========================================
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# Generated extension packages and private keys
+*.crx
+*.pem
+*.key
+
+# ==========================================
+# EDITORS AND IDE SETTINGS
+# ==========================================
+.vscode/
+.idea/
+*.sublime-workspace
+
+# ==========================================
+# WINDOWS / MACOS SYSTEM FILES
+# ==========================================
+.DS_Store
+Thumbs.db
+desktop.ini
