@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import re
@@ -33,10 +32,18 @@ def important_tokens(value: str) -> set[str]:
     }
 
 
-def similarity_score(query: str, candidate: str) -> float:
+def similarity_score(
+    query: str,
+    candidate: str,
+    floor: float = 0.0,
+) -> float:
     """
     Compare two text strings using character similarity
     and the overlap between important words.
+
+    NEW: "floor" makes this faster. When a quick check shows the
+    score can not reach the floor, the slow check is skipped and
+    0.0 is returned. Scores that matter are the same as before.
 
     This is text matching, not a generative AI model.
     """
@@ -49,26 +56,47 @@ def similarity_score(query: str, candidate: str) -> float:
     if query == candidate:
         return 1.0
 
-    character_score = SequenceMatcher(
-        None, query, candidate
-    ).ratio()
-
     query_tokens = important_tokens(query)
     candidate_tokens = important_tokens(candidate)
 
-    if not query_tokens or not candidate_tokens:
+    token_score = None
+
+    if query_tokens and candidate_tokens:
+        intersection = query_tokens & candidate_tokens
+        union = query_tokens | candidate_tokens
+
+        word_overlap = len(intersection) / len(union)
+        query_coverage = len(intersection) / len(query_tokens)
+
+        token_score = min(
+            1.0,
+            word_overlap * 0.65 + query_coverage * 0.35,
+        )
+
+    matcher = SequenceMatcher(None, query, candidate)
+
+    # Quick upper limits (cheap). The real score is never higher.
+    if floor > 0:
+        best_possible = max(
+            matcher.real_quick_ratio(),
+            token_score or 0.0,
+        )
+
+        if best_possible < floor:
+            return 0.0
+
+        best_possible = max(
+            matcher.quick_ratio(),
+            token_score or 0.0,
+        )
+
+        if best_possible < floor:
+            return 0.0
+
+    character_score = matcher.ratio()
+
+    if token_score is None:
         return character_score
-
-    intersection = query_tokens & candidate_tokens
-    union = query_tokens | candidate_tokens
-
-    word_overlap = len(intersection) / len(union)
-    query_coverage = len(intersection) / len(query_tokens)
-
-    token_score = (
-        word_overlap * 0.65
-        + query_coverage * 0.35
-    )
 
     return min(1.0, max(character_score, token_score))
 
@@ -93,12 +121,16 @@ def find_local_fallback_match(
         minimum_score = 0.72
         comparison_field = "normalized_question"
 
+    # A second-best result only matters when it is within 0.06
+    # of the best one, so weaker rows can be skipped quickly.
+    floor = minimum_score - 0.06
+
     candidates: list[tuple[float, sqlite3.Row]] = []
 
     for row in rows:
         stored_text = row[comparison_field]
 
-        score = similarity_score(query, stored_text)
+        score = similarity_score(query, stored_text, floor)
 
         candidates.append((score, row))
 

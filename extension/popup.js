@@ -134,7 +134,7 @@ async function sendToActiveTab(payload) {
         };
 
         console.error(
-            "Content script communication failed:",
+            "Content script communication failed:", 
             JSON.stringify(details, null, 2)
         );
 

@@ -6,17 +6,23 @@ console.log(
 );
 
 // ============================================================
-// ALLOWED SITES
-// Auto-answering only works on these sites. Keep this list the
-// same as the "matches" list in manifest.json.
-// To use a quiz site that YOU built and host, add its domain
-// here, for example: "my-own-quiz-site.com"
+// ALLOWED SITES  (THIS IS THE MOST IMPORTANT SETTING)
+//
+// Auto-answer, auto-scroll and auto-Next only work on the sites
+// in this list. On any other site the extension only SHOWS the
+// answer. This is why your real quiz site could not auto-answer.
+//
+// TO FIX: add the address of YOUR quiz site below.
+// Use only the domain name (no https://, no slash).
+// Example:  "myquiz.example.com"
+//
+// Also add the same site to "matches" in manifest.json.
 // ============================================================
 const ALLOWED_HOSTS = [
     "localhost",
     "127.0.0.1",
     "automatic-answering-system.onrender.com",
-    "https://semestral.amaes.com",
+    "semestral.amaes.com/2612"
 ];
 
 let enabled = false;
@@ -32,11 +38,7 @@ let autoScroll = false;
 
 // ============================================================
 // SPEED SETTINGS
-// The popup lets you choose how many seconds to pause per
-// question. 0 = INSTANT (the default): no waiting at all. The
-// extension answers the moment an answer is found, so a whole
-// page is finished in a few seconds.
-// For other speeds the pause is split like this:
+// 0 = INSTANT (default). Other speeds pause between steps:
 //   40%  wait, then answer
 //   40%  wait, then go to the next question
 // ============================================================
@@ -75,7 +77,7 @@ const PREFETCH_COUNT = 6;
 let answerTimer = null;
 let followUpTimer = null;
 
-// State for pages that show MANY questions (scrolling pages).
+// State for pages that show MANY questions.
 let multiQuestionPage = false;
 let runnerActive = false;
 let answeredElements = new WeakSet();
@@ -99,9 +101,8 @@ let incompleteRetries = 0;
 
 const OVERLAY_ID = "qa-assistant-overlay";
 
-// When a lookup fails (backend asleep, AI busy, network problem)
-// the same question is tried again a few times, with a short
-// pause that grows each time.
+// When a lookup fails, the same question is tried again a few
+// times, with a pause that grows each time.
 const MAX_LOOKUP_RETRIES = 4;
 const RETRY_BASE_DELAY_MS = 1500;
 const failureCounts = new Map();
@@ -110,8 +111,48 @@ const runnerFailures = new WeakMap();
 let applySkipCount = 0;
 
 // The backend (Render free plan) can need about a minute to wake up.
-// The background script retries during that time, so we wait longer.
-const BACKGROUND_TIMEOUT_MS = 150000;
+const BACKGROUND_TIMEOUT_MS = 120000;
+
+// After 8 seconds of waiting we tell the person why it is slow.
+const SLOW_NOTICE_MS = 8000;
+
+// ------------------------------------------------------------
+// NEW: keep going after the page changes.
+// When "Next page" reloads the page, the extension starts again
+// by itself, but ONLY if it was the extension that clicked Next
+// less than a minute ago. A normal refresh does NOT start it.
+// ------------------------------------------------------------
+const RESUME_KEY = "qaa_resume_time";
+const RESUME_MAX_AGE_MS = 60000;
+
+
+function markResume() {
+    try {
+        sessionStorage.setItem(RESUME_KEY, String(Date.now()));
+    } catch {
+        // Not important.
+    }
+}
+
+function clearResume() {
+    try {
+        sessionStorage.removeItem(RESUME_KEY);
+    } catch {
+        // Not important.
+    }
+}
+
+function shouldResume() {
+    try {
+        const time = Number(sessionStorage.getItem(RESUME_KEY) || 0);
+
+        sessionStorage.removeItem(RESUME_KEY);
+
+        return time > 0 && Date.now() - time < RESUME_MAX_AGE_MS;
+    } catch {
+        return false;
+    }
+}
 
 
 // Send a message to background.js. Never waits forever and gives a
@@ -172,19 +213,19 @@ function sendToBackground(message, timeoutMs = BACKGROUND_TIMEOUT_MS) {
 }
 
 // Containers that hold exactly ONE question.
+// ".que" is the question box used by Moodle quiz sites.
 const SPECIFIC_QUESTION_SELECTOR =
     "fieldset, [role='radiogroup'], [data-question], " +
-    ".question-container, .quiz-question, .question, .quiz-item";
+    ".que, .question-container, .quiz-question, .question, .quiz-item";
 
 init();
 
 
 async function init() {
     try {
-        // IMPORTANT: nothing starts by itself. The old saved
-        // "enabled" flag is deleted, and "enabled" always begins
-        // as false every time a page loads or refreshes.
-        // Only the Start button in the popup can turn it on.
+        // Nothing starts by itself. The old saved "enabled" flag
+        // is deleted. Only the Start button (or a Next click made
+        // by this extension a moment ago) can turn it on.
         await chrome.storage.local.remove("enabled");
 
         const state = await chrome.storage.local.get([
@@ -202,10 +243,23 @@ async function init() {
         console.log("[QAA DEBUG] Ready. Waiting for the Start button.", {
             subject,
             autoAnswer,
-            autoScroll
+            autoScroll,
+            allowedSite: isLocalPracticePage()
         });
 
         startObserver();
+
+        // Continue after the extension's own "Next page" click.
+        if (shouldResume() && subject) {
+            console.log("[QAA DEBUG] Continuing after Next page.");
+
+            startAssistant({
+                subject,
+                autoAnswer,
+                autoScroll,
+                answerSpeed: state.answerSpeed
+            });
+        }
     } catch (error) {
         console.error(
             "Question Assistant initialization failed:",
@@ -263,12 +317,43 @@ function startAssistant(settings) {
     // Wake the backend up right away (it may be asleep).
     sendToBackground({ type: "PING_BACKEND" }).catch(() => {});
 
-    showOverlay(
-        "Assistant started.\nLooking for questions...",
-        "info"
-    );
+    // Tell the person clearly when auto-answer is blocked.
+    const blocked = (autoAnswer || autoScroll) && !isLocalPracticePage();
+
+    if (blocked) {
+        const host = location.hostname;
+
+        showOverlay(
+            [
+                "AUTO-ANSWER IS BLOCKED ON THIS WEBSITE",
+                "",
+                `Website: ${host}`,
+                "",
+                "The extension will only SHOW answers here.",
+                "",
+                "To allow auto-answer, open extension/content.js and",
+                `add "${host}" to ALLOWED_HOSTS.`,
+                "Then reload the extension in chrome://extensions."
+            ].join("\n"),
+            "warning"
+        );
+    } else {
+        showOverlay(
+            "Assistant started.\nLooking for questions...",
+            "info"
+        );
+    }
 
     scheduleDetection();
+
+    if (blocked) {
+        return {
+            ok: false,
+            error:
+                `Started, but auto-answer is blocked on "${location.hostname}". ` +
+                "Add this site to ALLOWED_HOSTS in content.js."
+        };
+    }
 
     return { ok: true };
 }
@@ -286,6 +371,8 @@ function stopAssistant() {
     answerTimer = null;
     followUpTimer = null;
     retryTimer = null;
+
+    clearResume();
 
     showOverlay("Assistant paused.", "info");
 }
@@ -342,8 +429,7 @@ function scheduleDetection() {
 }
 
 
-// On a scrolling page, look at the page again after the user
-// (or the extension) scrolls.
+// On a scrolling page, look at the page again after scrolling.
 document.addEventListener(
     "scroll",
     (event) => {
@@ -371,7 +457,6 @@ document.addEventListener(
 
 
 // React when a setting changes in the popup.
-// (Start and Stop do NOT come through here any more.)
 chrome.storage.onChanged.addListener((changes, areaName) => {
     if (areaName !== "local") {
         return;
@@ -469,9 +554,7 @@ async function detectCurrentQuestion() {
 
     // The page may still be drawing the choices. Look again very
     // soon (at most 3 times) instead of using half a question.
-    const hasChoiceInputs = candidate.element.querySelector(
-        "input[type='radio'], input[type='checkbox']"
-    );
+    const hasChoiceInputs = realChoiceInputs(candidate.element).length > 0;
 
     if (
         hasChoiceInputs &&
@@ -493,18 +576,35 @@ async function detectCurrentQuestion() {
 
     requestInProgress = true;
 
+    // If the server is slow, say so (instead of looking frozen).
+    const slowTimer = setTimeout(() => {
+        if (enabled && lastQuestionKey === questionKey) {
+            showOverlay(
+                [
+                    "QUESTION DETECTED",
+                    candidate.question,
+                    "",
+                    "Still looking for the answer...",
+                    "The server may be waking up.",
+                    "Please wait. This can take up to 1 minute."
+                ].join("\n"),
+                "info"
+            );
+        }
+    }, SLOW_NOTICE_MS);
+
     try {
         await lookupAndShow(candidate);
         failureCounts.delete(questionKey);
     } catch (error) {
         handleLookupFailure(candidate, questionKey, error);
     } finally {
+        clearTimeout(slowTimer);
         requestInProgress = false;
     }
 
     // The page may have moved to another question while we were
-    // waiting for the backend. Look again (does nothing if the
-    // question is still the same one).
+    // waiting. Look again (does nothing if it is the same one).
     if (enabled) {
         scheduleDetection();
     }
@@ -542,8 +642,9 @@ async function lookupAndShow(candidate) {
         );
     }
 
-    // The existing matcher found a reliable result.
-    if (match.matched) {
+    // The database found an answer AND we can pick a choice
+    // (or there are no choices to pick from).
+    if (match.matched && answerFitsChoices(candidate, match)) {
         displayMatchResult(candidate, match);
         return;
     }
@@ -563,8 +664,23 @@ async function lookupAndShow(candidate) {
         return;
     }
 
-    // No reliable database/local match: try Gemini.
+    // No usable database answer: try Gemini.
     await requestStudyHelp(candidate);
+}
+
+
+// NEW: a database answer is only useful if it points to one of
+// the choices on the page. If not, we ask Gemini instead.
+function answerFitsChoices(candidate, match) {
+    if (!candidate.choices || candidate.choices.length === 0) {
+        return true;
+    }
+
+    return choiceIndexFor(
+        candidate.choices,
+        match.answer,
+        match
+    ) !== -1;
 }
 
 
@@ -750,7 +866,6 @@ async function requestStudyHelp(candidate) {
         payload: {
             subject,
             question: candidate.question,
-            // Gemini also sees the choices.
             choices: candidate.choices
         }
     });
@@ -776,6 +891,15 @@ async function requestStudyHelp(candidate) {
 }
 
 
+// A question box that sits INSIDE a Moodle ".que" box is part
+// of that question. We only use the whole ".que" box.
+function insideMoodleQuestion(element) {
+    const box = element.closest(".que");
+
+    return Boolean(box) && box !== element;
+}
+
+
 // Collect possible question containers from the page.
 function findBestQuestionCandidate() {
     const selectors = [
@@ -783,6 +907,7 @@ function findBestQuestionCandidate() {
         "[role='radiogroup']",
         "[role='group']",
         "[data-question]",
+        ".que",
         ".question-container",
         ".quiz-question",
         ".question",
@@ -807,13 +932,18 @@ function findBestQuestionCandidate() {
                 continue;
             }
 
+            if (insideMoodleQuestion(element)) {
+                continue;
+            }
+
             const candidate = buildCandidate(element);
 
             if (candidate) {
                 if (
                     selector === "fieldset" ||
                     selector === "[role='radiogroup']" ||
-                    selector === "[data-question]"
+                    selector === "[data-question]" ||
+                    selector === ".que"
                 ) {
                     candidate.score += 40;
                 }
@@ -878,6 +1008,26 @@ function buildCandidate(element) {
 
 // Extract the question from the container's visible text.
 function extractQuestion(element) {
+    // NEW: Moodle (and similar sites) put the question text in a
+    // box called "qtext". Use it when this container has exactly one.
+    const textBoxes = element.querySelectorAll(
+        ".qtext, .question-text"
+    );
+
+    if (textBoxes.length === 1) {
+        const text = removeQuestionNumber(
+            clean(
+                textBoxes[0].innerText ||
+                textBoxes[0].textContent ||
+                ""
+            )
+        );
+
+        if (text.length >= 3) {
+            return text.slice(0, 1500);
+        }
+    }
+
     const lines = getTextLines(element);
 
     // First, look for a normal question.
@@ -937,15 +1087,34 @@ function extractQuestion(element) {
 }
 
 
+// NEW: radio buttons and checkboxes that are really answer
+// choices. Moodle has a hidden "Flag question" checkbox that
+// must NOT be counted as a choice.
+function isRealChoice(input) {
+    const name = input.getAttribute("name") || "";
+
+    return !(
+        /:flagged$/.test(name) ||
+        input.classList.contains("questionflagcheckbox") ||
+        input.closest(".questionflag")
+    );
+}
+
+
+function realChoiceInputs(root) {
+    return Array.from(
+        root.querySelectorAll(
+            "input[type='radio'], input[type='checkbox']"
+        )
+    ).filter(isRealChoice);
+}
+
+
 // Extract choices from labels or text such as "A. Example".
 function extractChoices(element) {
     const choices = [];
 
-    const inputs = element.querySelectorAll(
-        "input[type='radio'], input[type='checkbox']"
-    );
-
-    for (const input of inputs) {
+    for (const input of realChoiceInputs(element)) {
         const label = findLabel(input);
 
         if (!label) {
@@ -1284,13 +1453,13 @@ function viewportCenterDistance(element) {
 // ============================================================
 // SCROLLING PAGES (many questions on one page)
 //
-// How it works, in simple words:
 //  1. Find every question block on the page.
 //  2. Look up the answers for the next few questions AT THE SAME
-//     TIME (database first, Gemini only when needed). So the slow
-//     AI wait happens once, not once per question.
+//     TIME (database first, Gemini only when needed).
 //  3. Go through the questions in order: scroll to it, answer it,
 //     wait a moment, move on.
+//  4. NEW: when all are answered, click "Next page" (if the
+//     Auto-scroll switch is ON).
 // ============================================================
 
 // Find every question block on the page, in page order.
@@ -1308,7 +1477,7 @@ function findQuestionBlocks() {
 
 
 // Way 1: pages that wrap each question in a fieldset or in
-// a .question / .quiz-question / .quiz-item style container.
+// a .que / .question / .quiz-question style container.
 function findBlocksFromContainers() {
     const found = [];
 
@@ -1317,7 +1486,8 @@ function findBlocksFromContainers() {
     )) {
         if (
             element.closest(`#${OVERLAY_ID}`) ||
-            !isVisible(element)
+            !isVisible(element) ||
+            insideMoodleQuestion(element)
         ) {
             continue;
         }
@@ -1336,11 +1506,7 @@ function findBlocksFromContainers() {
 // Way 2: pages without special classes. Every group of radio
 // buttons (same name) is treated as one question.
 function findBlocksFromChoiceGroups() {
-    const inputs = Array.from(
-        document.querySelectorAll(
-            "input[type='radio'], input[type='checkbox']"
-        )
-    ).filter((input) =>
+    const inputs = realChoiceInputs(document).filter((input) =>
         !input.disabled &&
         !input.closest(`#${OVERLAY_ID}`)
     );
@@ -1676,7 +1842,8 @@ async function resolveQuestion(candidate) {
             () => lookupDatabase(candidate)
         );
 
-        if (match.matched) {
+        // The database answer must point to a choice on the page.
+        if (match.matched && answerFitsChoices(candidate, match)) {
             finishMatch();
 
             return {
@@ -1767,12 +1934,8 @@ async function startRunner() {
         let blocks = findQuestionBlocks();
 
         // Start looking up ALL the answers right now, together.
-        // The database answers in a moment, and every question
-        // that needs the AI travels in ONE request.
         prefetchAhead(blocks, 0, blocks.length);
 
-        // Tell the user something is happening (the backend can
-        // take a little while to wake up the first time).
         showOverlay(
             [
                 `Found ${blocks.length} questions.`,
@@ -1831,6 +1994,26 @@ async function startRunner() {
                         ].join("\n"),
                         "success"
                     );
+
+                    // NEW: go to the next page (only once).
+                    if (autoScroll) {
+                        const nextButton = findNextButton();
+
+                        if (nextButton) {
+                            if (NEXT_DELAY_MS > 0) {
+                                await sleep(NEXT_DELAY_MS);
+                            }
+
+                            if (enabled && autoAnswer && autoScroll) {
+                                showOverlay(
+                                    "ALL QUESTIONS ANSWERED\n\nGoing to the next page...",
+                                    "success"
+                                );
+
+                                clickNext(nextButton);
+                            }
+                        }
+                    }
                 }
 
                 break;
@@ -2264,6 +2447,18 @@ function canContinue() {
 }
 
 
+// NEW: click a "Next" button. The page may reload, so we leave a
+// small note that lets the extension continue by itself.
+function clickNext(button) {
+    markResume();
+
+    // If the page did not reload, remove the note again.
+    setTimeout(clearResume, 8000);
+
+    button.click();
+}
+
+
 // Step 3: go to the next question.
 function scheduleNextQuestion(currentElement) {
     clearTimeout(followUpTimer);
@@ -2290,7 +2485,7 @@ function scheduleNextQuestion(currentElement) {
         if (nextButton) {
             const keyBeforeClick = lastQuestionKey;
 
-            nextButton.click();
+            clickNext(nextButton);
 
             // Give the page a moment to show the next question.
             setTimeout(() => {
@@ -2320,7 +2515,7 @@ function scheduleNextQuestion(currentElement) {
             return;
         }
 
-        // Other local practice pages: use ordinary scrolling.
+        // Other pages: use ordinary scrolling.
         scrollToNextQuestion(currentElement);
 
         setTimeout(() => {
@@ -2342,13 +2537,15 @@ function isDisabledElement(element) {
 }
 
 
-// Find the "Next Question" button on the practice page.
+// Find the "Next" button.
 function findNextButton() {
-    // Your practice page's own button.
-    const own = document.querySelector("#next-question");
+    // Your practice page's own button, and the Moodle one.
+    const known = document.querySelector(
+        "#next-question, #mod_quiz-next-nav"
+    );
 
-    if (own && !isDisabledElement(own) && isVisible(own)) {
-        return own;
+    if (known && !isDisabledElement(known) && isVisible(known)) {
+        return known;
     }
 
     // Other pages: a button whose whole text is "Next",
@@ -2388,11 +2585,13 @@ function findNextButton() {
 // MULTIPLE CHOICE
 // ============================================================
 
-function selectMatchingChoice(candidate, answer, result) {
-    const choices = candidate.choices || [];
+// NEW: finds WHICH choice the answer points to. Returns -1 when
+// no choice fits. (This part was inside selectMatchingChoice.)
+function choiceIndexFor(choices, answer, result) {
+    result = result || {};
 
-    if (choices.length === 0) {
-        return null;
+    if (!choices || choices.length === 0) {
+        return -1;
     }
 
     let choiceIndex = -1;
@@ -2473,6 +2672,51 @@ function selectMatchingChoice(candidate, answer, result) {
         }
     }
 
+    return choiceIndex;
+}
+
+
+// NEW: tick a radio button or checkbox in the safest way.
+function checkInput(input) {
+    if (input.checked) {
+        return true;
+    }
+
+    input.click();
+
+    if (input.checked) {
+        return true;
+    }
+
+    // Some sites need the click on the label.
+    const label = findLabel(input);
+
+    if (label) {
+        label.click();
+    }
+
+    if (input.checked || !input.isConnected) {
+        return true;
+    }
+
+    // Last try: set it ourselves and tell the page.
+    input.checked = true;
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+
+    return input.checked;
+}
+
+
+function selectMatchingChoice(candidate, answer, result) {
+    const choices = candidate.choices || [];
+
+    if (choices.length === 0) {
+        return null;
+    }
+
+    const choiceIndex = choiceIndexFor(choices, answer, result);
+
     if (choiceIndex === -1) {
         return null;
     }
@@ -2480,11 +2724,8 @@ function selectMatchingChoice(candidate, answer, result) {
     const chosenText = choices[choiceIndex];
     const wantedText = normalize(stripChoicePrefix(chosenText));
 
-    const inputs = Array.from(
-        candidate.element.querySelectorAll(
-            "input[type='radio'], input[type='checkbox']"
-        )
-    ).filter((input) => !input.disabled);
+    const inputs = realChoiceInputs(candidate.element)
+        .filter((input) => !input.disabled);
 
     let input = inputs.find((item) => {
         const label = findLabel(item);
@@ -2500,13 +2741,11 @@ function selectMatchingChoice(candidate, answer, result) {
     }
 
     if (input) {
-        if (!input.checked) {
-            input.click();
-        }
+        const ok = checkInput(input);
 
         // If the page re-drew the radio button, the old one is no
         // longer on the page. That is not a failure.
-        if (!input.checked && input.isConnected) {
+        if (!ok && input.isConnected) {
             return null;
         }
 
@@ -2610,7 +2849,7 @@ function findClickableChoice(container, wantedText) {
 
 function stripChoicePrefix(value) {
     return String(value || "").replace(
-        /^\s*[A-H]\s*[.):\-]\s*/,
+        /^\s*[A-Ha-h]\s*[.):\-]\s*/,
         ""
     ).trim();
 }
@@ -2652,10 +2891,6 @@ function typeIntoQuestionField(candidate, answer) {
 
     // Safety: only type when we are sure these boxes belong to
     // THIS question.
-    //  - the container holds exactly one question, OR
-    //  - there is only one text box, OR
-    //  - the page has no separate question containers at all
-    //    (one question shown at a time).
     const isSpecific = container.matches(SPECIFIC_QUESTION_SELECTOR);
     const isSafe =
         isSpecific ||

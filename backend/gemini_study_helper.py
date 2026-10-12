@@ -32,6 +32,21 @@ _CHOICE_PREFIX = re.compile(r"^\s*[A-Ha-h][.):]\s+")
 _LETTERS = "ABCDEFGHIJKLMNOPQRST"
 
 # ------------------------------------------------------------
+# TIME LIMITS (NEW)
+# The extension gives up on a backend request after 25 seconds
+# and starts it again. So the backend must finish BEFORE that.
+#   - One Gemini call waits at most 10 seconds.
+#   - No new Gemini call starts after 12 seconds in total.
+# ------------------------------------------------------------
+_CALL_TIMEOUT_MS = 10000
+_NO_NEW_CALL_AFTER_SECONDS = 12
+
+# A model that does not exist is skipped for 10 minutes, so we
+# do not waste time asking it again and again.
+_dead_models: dict = {}
+_DEAD_SECONDS = 600
+
+# ------------------------------------------------------------
 # SPEED-UPS
 #   1. One shared Gemini client (keeps the connection open).
 #   2. "Thinking" turned off and a small output limit.
@@ -59,11 +74,11 @@ def _get_client():
     with _client_lock:
         if _client is None:
             try:
-                # Give up on a stuck Gemini call after 20 seconds,
-                # so the extension is not left waiting.
                 _client = genai.Client(
                     api_key=api_key,
-                    http_options=types.HttpOptions(timeout=20000),
+                    http_options=types.HttpOptions(
+                        timeout=_CALL_TIMEOUT_MS
+                    ),
                 )
             except Exception:
                 _client = genai.Client(api_key=api_key)
@@ -108,6 +123,12 @@ def _is_config_error(exc: Exception) -> bool:
     return _error_code(exc) == 400 or "thinking" in str(exc).lower()
 
 
+def _is_missing_model_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+
+    return _error_code(exc) == 404 or "not found" in text
+
+
 def _is_busy_error(exc: Exception) -> bool:
     text = str(exc).lower()
 
@@ -120,8 +141,8 @@ def _is_busy_error(exc: Exception) -> bool:
     )
 
 
-def _call_model(client, model: str, prompt: str, config):
-    """One Gemini call. A busy server is tried once more."""
+def _call_model(client, model: str, prompt: str, config, started: float):
+    """One Gemini call. A busy server is tried once more (if time allows)."""
     for attempt in range(2):
         try:
             return client.models.generate_content(
@@ -130,12 +151,18 @@ def _call_model(client, model: str, prompt: str, config):
                 config=config,
             )
         except Exception as exc:
+            too_late = (
+                time.monotonic() - started
+                > _NO_NEW_CALL_AFTER_SECONDS - 3
+            )
+
             if (
                 attempt == 0
+                and not too_late
                 and _is_busy_error(exc)
                 and not _is_config_error(exc)
             ):
-                time.sleep(0.8)
+                time.sleep(0.5)
                 continue
 
             raise
@@ -145,30 +172,48 @@ def _generate(client, prompt: str, max_tokens: int, json_mode: bool = False):
     """
     Call Gemini with the fastest config that the model accepts.
     If a model is busy, out of quota or missing, the next model in
-    MODEL_NAMES is used.
+    MODEL_NAMES is used. Stops early when time is almost up.
     """
     global _variant_index
 
+    started = time.monotonic()
     last_error = None
 
     for model in MODEL_NAMES:
+        # Skip a model we already know does not exist.
+        dead_until = _dead_models.get(model, 0)
+
+        if dead_until > time.time():
+            continue
+
         variants = _config_variants(max_tokens, json_mode)
 
         start = min(_variant_index, len(variants) - 1)
 
         for i in range(start, len(variants)):
+            if time.monotonic() - started > _NO_NEW_CALL_AFTER_SECONDS:
+                raise last_error or RuntimeError(
+                    "Gemini took too long to answer."
+                )
+
             try:
-                response = _call_model(client, model, prompt, variants[i])
+                response = _call_model(
+                    client, model, prompt, variants[i], started
+                )
             except Exception as exc:
                 last_error = exc
+
+                if _is_missing_model_error(exc):
+                    _dead_models[model] = time.time() + _DEAD_SECONDS
+                    print(f"Gemini model {model} not found. Skipping it.")
+                    break
 
                 if _is_config_error(exc):
                     # This setting does not suit the model.
                     _variant_index = i + 1
                     continue
 
-                # Busy, out of quota or model not found:
-                # try the next model.
+                # Busy or out of quota: try the next model.
                 print(
                     f"Gemini model {model} failed:",
                     type(exc).__name__,
