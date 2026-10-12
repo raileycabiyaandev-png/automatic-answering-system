@@ -1096,7 +1096,10 @@ function isRealChoice(input) {
     return !(
         /:flagged$/.test(name) ||
         input.classList.contains("questionflagcheckbox") ||
-        input.closest(".questionflag")
+        input.closest(".questionflag") ||
+        // Moodle's hidden "Clear my choice" radio button.
+        input.closest(".qtype_multichoice_clearchoice") ||
+        (input.type === "radio" && input.value === "-1")
     );
 }
 
@@ -1162,6 +1165,20 @@ function findLabel(input) {
 
         if (label) {
             return label;
+        }
+    }
+
+    // NEW: Moodle's multiple choice uses aria-labelledby that
+    // points to a <div> instead of a <label>.
+    const labelledBy = input.getAttribute("aria-labelledby");
+
+    if (labelledBy) {
+        for (const labelId of labelledBy.split(/\s+/)) {
+            const element = document.getElementById(labelId);
+
+            if (element) {
+                return element;
+            }
         }
     }
 
