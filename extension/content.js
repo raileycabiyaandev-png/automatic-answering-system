@@ -22,7 +22,7 @@ const ALLOWED_HOSTS = [
     "localhost",
     "127.0.0.1",
     "automatic-answering-system.onrender.com",
-    "https://semestral.amaes.com/2612"
+    "semestral.amaes.com/2612/mod/quiz/"
 ];
 
 let enabled = false;
