@@ -117,7 +117,7 @@ const BACKGROUND_TIMEOUT_MS = 120000;
 const SLOW_NOTICE_MS = 8000;
 
 // ------------------------------------------------------------
-// NEW: keep going after the page changes.
+// Keep going after the page changes.
 // When "Next page" reloads the page, the extension starts again
 // by itself, but ONLY if it was the extension that clicked Next
 // less than a minute ago. A normal refresh does NOT start it.
@@ -669,7 +669,7 @@ async function lookupAndShow(candidate) {
 }
 
 
-// NEW: a database answer is only useful if it points to one of
+// A database answer is only useful if it points to one of
 // the choices on the page. If not, we ask Gemini instead.
 function answerFitsChoices(candidate, match) {
     if (!candidate.choices || candidate.choices.length === 0) {
@@ -900,6 +900,139 @@ function insideMoodleQuestion(element) {
 }
 
 
+// ============================================================
+// NEW: MATCHING QUESTIONS (a table of rows, each with a
+// drop-down list). Moodle's "match" question type.
+//
+// Each ROW is treated as its own multiple choice question:
+//   question = the text on the left of the row
+//   choices  = the options of the drop-down (without "Choose...")
+// This way the database / Gemini lookup works with no change
+// in the backend.
+// ============================================================
+
+// The first option of a Moodle drop-down ("Choose...") has the
+// value 0 (or is empty). It is not a real answer.
+function isMatchPlaceholder(option) {
+    return option.value === "" || option.value === "0";
+}
+
+
+// The real options of a drop-down, in page order.
+function matchOptions(select) {
+    return Array.from(select.options).filter(
+        (option) => !isMatchPlaceholder(option)
+    );
+}
+
+
+// All table rows (inside a quiz question) that have a drop-down.
+function matchRows(root) {
+    return Array.from(
+        root.querySelectorAll(".que tr, table.answer tr")
+    ).filter((row) => row.querySelector("select"));
+}
+
+
+// A container that is a matching question (it has drop-down rows
+// and no radio buttons or checkboxes of its own).
+function isMatchContainer(element) {
+    return (
+        matchRows(element).length > 0 &&
+        realChoiceInputs(element).length === 0
+    );
+}
+
+
+// Build a question out of ONE row of a matching question.
+function buildMatchRowCandidate(row) {
+    const select = row.querySelector("select");
+
+    if (!select || select.disabled) {
+        return null;
+    }
+
+    const promptCell =
+        row.querySelector("td.text") || row.querySelector("td");
+
+    // The text cell must not be the cell that holds the drop-down,
+    // or the options would be read as the question.
+    if (!promptCell || promptCell.contains(select)) {
+        return null;
+    }
+
+    const question = clean(
+        promptCell.innerText || promptCell.textContent || ""
+    );
+
+    if (question.length < 2) {
+        return null;
+    }
+
+    const options = matchOptions(select);
+
+    if (options.length < 2) {
+        return null;
+    }
+
+    // Not made unique on purpose: the position of each choice must
+    // stay the same as the position of its option.
+    const choices = options.map((option) =>
+        clean(option.textContent || "")
+    );
+
+    let score = 30;
+
+    if (question.length >= 10 && question.length <= 500) {
+        score += 10;
+    }
+
+    return {
+        question: question.slice(0, 1500),
+        choices,
+        element: row,
+        select,
+        score
+    };
+}
+
+
+// Pick the option in the drop-down that the answer points to.
+function selectMatchingOption(candidate, answer, result) {
+    const select = candidate.select;
+
+    if (!select || !select.isConnected || select.disabled) {
+        return null;
+    }
+
+    const options = matchOptions(select);
+
+    const choices = options.map((option) =>
+        clean(option.textContent || "")
+    );
+
+    const index = choiceIndexFor(choices, answer, result);
+
+    if (index === -1 || !options[index]) {
+        return null;
+    }
+
+    const option = options[index];
+
+    select.value = option.value;
+    option.selected = true;
+
+    select.dispatchEvent(new Event("input", { bubbles: true }));
+    select.dispatchEvent(new Event("change", { bubbles: true }));
+
+    if (select.value !== option.value) {
+        return null;
+    }
+
+    return clean(option.textContent || "") || String(answer);
+}
+
+
 // Collect possible question containers from the page.
 function findBestQuestionCandidate() {
     const selectors = [
@@ -936,6 +1069,11 @@ function findBestQuestionCandidate() {
                 continue;
             }
 
+            // NEW: matching questions are handled row by row.
+            if (isMatchContainer(element)) {
+                continue;
+            }
+
             const candidate = buildCandidate(element);
 
             if (candidate) {
@@ -950,6 +1088,23 @@ function findBestQuestionCandidate() {
 
                 candidates.push(candidate);
             }
+        }
+    }
+
+    // NEW: every row of a matching question is a candidate.
+    for (const row of matchRows(document)) {
+        if (
+            row.closest(`#${OVERLAY_ID}`) ||
+            !isVisible(row)
+        ) {
+            continue;
+        }
+
+        const candidate = buildMatchRowCandidate(row);
+
+        if (candidate) {
+            candidate.score += 40;
+            candidates.push(candidate);
         }
     }
 
@@ -975,6 +1130,11 @@ function findBestQuestionCandidate() {
 
 
 function buildCandidate(element) {
+    // NEW: a table row with a drop-down is a matching question row.
+    if (element.matches && element.matches("tr")) {
+        return buildMatchRowCandidate(element);
+    }
+
     const question = extractQuestion(element);
 
     if (!question) {
@@ -1008,7 +1168,7 @@ function buildCandidate(element) {
 
 // Extract the question from the container's visible text.
 function extractQuestion(element) {
-    // NEW: Moodle (and similar sites) put the question text in a
+    // Moodle (and similar sites) put the question text in a
     // box called "qtext". Use it when this container has exactly one.
     const textBoxes = element.querySelectorAll(
         ".qtext, .question-text"
@@ -1087,7 +1247,7 @@ function extractQuestion(element) {
 }
 
 
-// NEW: radio buttons and checkboxes that are really answer
+// Radio buttons and checkboxes that are really answer
 // choices. Moodle has a hidden "Flag question" checkbox that
 // must NOT be counted as a choice.
 function isRealChoice(input) {
@@ -1168,7 +1328,7 @@ function findLabel(input) {
         }
     }
 
-    // NEW: Moodle's multiple choice uses aria-labelledby that
+    // Moodle's multiple choice uses aria-labelledby that
     // points to a <div> instead of a <label>.
     const labelledBy = input.getAttribute("aria-labelledby");
 
@@ -1475,7 +1635,7 @@ function viewportCenterDistance(element) {
 //     TIME (database first, Gemini only when needed).
 //  3. Go through the questions in order: scroll to it, answer it,
 //     wait a moment, move on.
-//  4. NEW: when all are answered, click "Next page" (if the
+//  4. When all are answered, click "Next page" (if the
 //     Auto-scroll switch is ON).
 // ============================================================
 
@@ -1509,12 +1669,44 @@ function findBlocksFromContainers() {
             continue;
         }
 
+        // NEW: a matching question is not one block. Its ROWS are.
+        if (isMatchContainer(element)) {
+            continue;
+        }
+
         const candidate = buildCandidate(element);
 
         if (candidate && hasAnswerArea(candidate)) {
             found.push(candidate);
         }
     }
+
+    // NEW: every row of every matching question is a block.
+    for (const row of matchRows(document)) {
+        if (
+            row.closest(`#${OVERLAY_ID}`) ||
+            !isVisible(row)
+        ) {
+            continue;
+        }
+
+        const candidate = buildMatchRowCandidate(row);
+
+        if (candidate) {
+            found.push(candidate);
+        }
+    }
+
+    // NEW: keep the blocks in the same order as on the page.
+    found.sort((a, b) => {
+        if (a.element === b.element) {
+            return 0;
+        }
+
+        const position = a.element.compareDocumentPosition(b.element);
+
+        return position & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1;
+    });
 
     return removeNestedBlocks(found);
 }
@@ -2012,7 +2204,7 @@ async function startRunner() {
                         "success"
                     );
 
-                    // NEW: go to the next page (only once).
+                    // Go to the next page (only once).
                     if (autoScroll) {
                         const nextButton = findNextButton();
 
@@ -2332,8 +2524,13 @@ function autoAnswerCandidate(candidate, answer, result = {}) {
 }
 
 
-// Select a choice or type into a text box.
+// Select a choice, pick a drop-down option, or type into a text box.
 function performAnswer(candidate, answer, result) {
+    // NEW: a row of a matching question (drop-down list).
+    if (candidate.select) {
+        return selectMatchingOption(candidate, answer, result);
+    }
+
     if (candidate.choices.length > 0) {
         // Multiple choice.
         return selectMatchingChoice(candidate, answer, result);
@@ -2464,7 +2661,7 @@ function canContinue() {
 }
 
 
-// NEW: click a "Next" button. The page may reload, so we leave a
+// Click a "Next" button. The page may reload, so we leave a
 // small note that lets the extension continue by itself.
 function clickNext(button) {
     markResume();
@@ -2554,6 +2751,16 @@ function isDisabledElement(element) {
 }
 
 
+// NEW: buttons that end the quiz are never clicked automatically.
+function isFinishButton(element) {
+    const raw = element instanceof HTMLInputElement
+        ? element.value
+        : element.textContent;
+
+    return /\b(finish|submit)\b/i.test(clean(raw || ""));
+}
+
+
 // Find the "Next" button.
 function findNextButton() {
     // Your practice page's own button, and the Moodle one.
@@ -2561,7 +2768,14 @@ function findNextButton() {
         "#next-question, #mod_quiz-next-nav"
     );
 
-    if (known && !isDisabledElement(known) && isVisible(known)) {
+    // CHANGED: on the last Moodle page this same button says
+    // "Finish attempt ...". It must NOT be clicked.
+    if (
+        known &&
+        !isDisabledElement(known) &&
+        isVisible(known) &&
+        !isFinishButton(known)
+    ) {
         return known;
     }
 
@@ -2602,8 +2816,8 @@ function findNextButton() {
 // MULTIPLE CHOICE
 // ============================================================
 
-// NEW: finds WHICH choice the answer points to. Returns -1 when
-// no choice fits. (This part was inside selectMatchingChoice.)
+// Finds WHICH choice the answer points to. Returns -1 when
+// no choice fits.
 function choiceIndexFor(choices, answer, result) {
     result = result || {};
 
@@ -2693,7 +2907,7 @@ function choiceIndexFor(choices, answer, result) {
 }
 
 
-// NEW: tick a radio button or checkbox in the safest way.
+// Tick a radio button or checkbox in the safest way.
 function checkInput(input) {
     if (input.checked) {
         return true;
