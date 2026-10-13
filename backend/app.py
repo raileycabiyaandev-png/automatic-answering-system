@@ -15,6 +15,8 @@ from pydantic import BaseModel, Field
 from local_fallback import find_local_fallback_match
 from gemini_study_helper import get_study_help, get_study_help_batch
 
+from functools import lru_cache
+
 
 # ============================================================
 # CONFIGURATION
@@ -415,45 +417,64 @@ def _find_match(
             question=cleaned_question,
         )
 
+        # ========================================================
+    # SCORE EVERY STORED ROW (question text AND answer text),
+    # keep the best few, then use the choices to decide.
     # ========================================================
-    # DIFFERENT MATCHING STRATEGY FOR DIFFERENT INPUT TYPES
-    # ========================================================
+
+    concept = (
+        extract_question_concept(cleaned_question)
+        if input_type == "direct_question"
+        else ""
+    )
+
+    candidates = []
+    top = 0.0
+
+    for row in rows:
+        score = clue_similarity_score(
+            normalized_input,
+            _normalized(row["question_text"]),
+            top - 0.10 if top > 0.10 else 0.0,
+        )
+        kind = "clue_match"
+
+        if input_type == "direct_question":
+            answer_score = answer_concept_score(
+                concept, row["answer_text"]
+            )
+
+            if answer_score > score:
+                score, kind = answer_score, "answer_match"
+
+        if score > 0:
+            candidates.append((score, row, kind))
+            top = max(top, score)
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    candidates = candidates[:10]
 
     best_row = None
     best_score = 0.0
     best_type = "no_match"
 
-    if input_type == "direct_question":
+    if candidates:
+        best_score, best_row, best_type = candidates[0]
 
-        # Example: "What is load testing?"
-        # We mainly search the ANSWER, because the answer
-        # itself is usually the subject being asked about.
-        concept = extract_question_concept(cleaned_question)
+        # Multiple choice: if the best row's answer is not one of
+        # the choices, take the next close row that IS.
+        if payload.choices:
+            for score, row, kind in candidates:
+                if score < max(0.75, candidates[0][0] - 0.10):
+                    break
 
-        for row in rows:
+                index, _label = find_matching_choice(
+                    row["answer_text"], payload.choices
+                )
 
-            score = answer_concept_score(concept, row["answer_text"])
-
-            if score > best_score:
-                best_score = score
-                best_row = row
-                best_type = "answer_match"
-
-    else:
-
-        # Definition / clue. Search the stored CLUE instead.
-        for row in rows:
-
-            score = clue_similarity_score(
-                normalized_input,
-                row["normalized_question"],
-                best_score,
-            )
-
-            if score > best_score:
-                best_score = score
-                best_row = row
-                best_type = "clue_match"
+                if index is not None:
+                    best_score, best_row, best_type = score, row, kind
+                    break
 
     # ========================================================
     # LOCAL FALLBACK
@@ -682,21 +703,33 @@ def extract_question_concept(question: str) -> str:
     return normalized
 
 
-def answer_concept_score(concept: str, answer: str) -> float:
+@lru_cache(maxsize=60000)
+def _tokens(value: str) -> frozenset:
+    return frozenset(get_important_tokens(value))
 
+
+@lru_cache(maxsize=60000)
+def _normalized(value: str) -> str:
+    return normalize_for_matching(value)
+
+
+def answer_concept_score(concept: str, answer: str) -> float:
     concept = normalize_for_matching(concept)
     answer = normalize_for_matching(answer)
 
     if not concept or not answer:
         return 0.0
 
-    # Exact matches are reliable.
     if concept == answer:
         return 1.0
 
-    # Accept the complete concept inside a longer answer.
+    # One contains the other. The closer the lengths, the better
+    # ("testing" inside "load testing" must NOT score high).
     if concept in answer:
-        return 0.95
+        return 0.80 + 0.19 * (len(concept) / len(answer))
+
+    if answer in concept and len(answer) >= 4:
+        return 0.80 + 0.19 * (len(answer) / len(concept))
 
     concept_tokens = set(get_important_tokens(concept))
     answer_tokens = set(get_important_tokens(answer))
@@ -704,7 +737,6 @@ def answer_concept_score(concept: str, answer: str) -> float:
     if not concept_tokens or not answer_tokens:
         return 0.0
 
-    # Measure the overlap between meaningful words.
     return (
         len(concept_tokens & answer_tokens)
         / len(concept_tokens | answer_tokens)
@@ -716,13 +748,7 @@ def clue_similarity_score(
     clue: str,
     best_so_far: float = 0.0,
 ) -> float:
-    """
-    How alike are the question and a stored clue? (0 to 1)
-
-    NEW: "best_so_far" makes this faster. If a quick check shows
-    this clue can not beat the best one found so far, the slow
-    check is skipped. The final winner is the same as before.
-    """
+    """How alike are the question and a stored clue? (0 to 1)"""
 
     if not question or not clue:
         return 0.0
@@ -730,34 +756,42 @@ def clue_similarity_score(
     if question == clue:
         return 1.0
 
-    question_tokens = set(get_important_tokens(question))
-    clue_tokens = set(get_important_tokens(clue))
+    q_tokens = _tokens(question)
+    c_tokens = _tokens(clue)
 
-    if not question_tokens or not clue_tokens:
+    # One text is (almost) fully inside the other. This is what
+    # happens when the page sends only a PART of the stored clue
+    # (the text before or after an answer box).
+    containment = 0.0
+
+    if len(q_tokens) >= 3 and len(c_tokens) >= 3:
+        small = min(len(q_tokens), len(c_tokens))
+        large = max(len(q_tokens), len(c_tokens))
+        overlap = len(q_tokens & c_tokens) / small
+
+        if overlap >= 0.95:
+            base = 0.95 if small >= 5 else 0.93
+            # Tighter clues rank first.
+            containment = min(0.99, base + 0.04 * (small / large))
+
+    if containment >= 0.92:
+        return containment
+
+    if not q_tokens or not c_tokens:
         token_score = 0.0
     else:
-        token_score = (
-            len(question_tokens & clue_tokens)
-            / len(question_tokens | clue_tokens)
-        )
+        token_score = len(q_tokens & c_tokens) / len(q_tokens | c_tokens)
 
     matcher = SequenceMatcher(None, question, clue)
 
     if best_so_far > 0:
-        # Quick upper limits. The real score is never higher.
-        if (
-            matcher.real_quick_ratio() * 0.65 + token_score * 0.35
-            <= best_so_far
-        ):
-            return 0.0
+        if matcher.real_quick_ratio() * 0.65 + token_score * 0.35 <= best_so_far:
+            return containment
 
-        if (
-            matcher.quick_ratio() * 0.65 + token_score * 0.35
-            <= best_so_far
-        ):
-            return 0.0
+        if matcher.quick_ratio() * 0.65 + token_score * 0.35 <= best_so_far:
+            return containment
 
-    return matcher.ratio() * 0.65 + token_score * 0.35
+    return max(containment, matcher.ratio() * 0.65 + token_score * 0.35)
 
 
 # ============================================================

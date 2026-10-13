@@ -1,23 +1,34 @@
+# backend/import_google_sources.py
+"""
+Imports questions + answers from the Google Sheets embedded in the
+Jenny's Blogspot posts listed in subjects.source_url.
+
+SAFE: nothing is deleted. A backup copy of questions.db is made
+first, and only rows that do not exist yet are added.
+
+Usage:
+    python import_google_sources.py --dry-run     (shows what would be added)
+    python import_google_sources.py               (adds the missing rows)
+    python import_google_sources.py --subject "Load Testing"
+"""
 from __future__ import annotations
 
+import argparse
 import csv
 import io
 import re
+import shutil
 import sqlite3
+import time
+from datetime import datetime
 from pathlib import Path
-from statistics import mean
 from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
 
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
-
 BASE_DIR = Path(__file__).resolve().parent
-
 DB_PATH = BASE_DIR / "questions.db"
 
 USER_AGENT = (
@@ -25,8 +36,38 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/154.0.0.0 Safari/537.36"
 )
-
 TIMEOUT = 30
+
+SHEET_RE = re.compile(
+    r"https?://docs\.google\.com/spreadsheets/d/"
+    r"(e/[\w-]+|[\w-]+)([^\s\"'<>\\]*)",
+    re.IGNORECASE,
+)
+
+HEADER_WORDS = {
+    "question", "questions", "answer", "answers", "clue", "clues",
+    "description", "correct answer", "statement", "item", "key",
+    "response", "definition", "term",
+}
+QUESTION_HEADERS = {
+    "question", "questions", "clue", "clues", "statement",
+    "description", "item", "definition",
+}
+ANSWER_HEADERS = {
+    "answer", "answers", "correct answer", "key", "response", "term",
+}
+
+# Only real blog/footer noise. (Single words such as "comments"
+# are NOT here, because real questions can contain them.)
+NOISE_PHRASES = [
+    "what do you think of this blog",
+    "#sarcasticgamer",
+    "#sarcasticreview",
+    "powered by blogger",
+]
+
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": USER_AGENT})
 
 
 # ============================================================
@@ -34,86 +75,69 @@ TIMEOUT = 30
 # ============================================================
 
 def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--subject", default="")
+    args = parser.parse_args()
 
     print("=" * 70)
-    print("GOOGLE SHEETS QUESTION IMPORTER")
+    print("GOOGLE SHEETS QUESTION IMPORTER" +
+          ("  (DRY RUN - nothing is written)" if args.dry_run else ""))
     print("=" * 70)
 
     subjects = get_subjects()
 
-    total_saved = 0
+    if args.subject:
+        subjects = [
+            s for s in subjects
+            if s["name"].lower() == args.subject.strip().lower()
+        ]
+
+    if not args.dry_run:
+        backup_database()
+
+    summary = []
 
     for subject in subjects:
-
         print()
         print("-" * 70)
-        print(
-            f"SUBJECT: {subject['name']}"
-        )
-        print(
-            f"SOURCE:  {subject['source_url']}"
-        )
+        print(f"SUBJECT: {subject['name']}")
+        print(f"SOURCE:  {subject['source_url']}")
         print("-" * 70)
 
         try:
+            records = collect_records(subject["source_url"])
+            print(f"Valid records found online: {len(records)}")
 
-            csv_url = find_google_sheet_csv(
-                subject["source_url"]
+            added, existing, blocked = save_records(
+                subject["id"], records, dry_run=args.dry_run
             )
 
-            if not csv_url:
+            print(f"Already in database: {existing}")
+            print(
+                f"{'Would add' if args.dry_run else 'Added'}: {added}"
+            )
 
+            if blocked:
                 print(
-                    "No Google Sheet source found."
+                    f"Refused by a database UNIQUE rule: {blocked} "
+                    "(see the note about the schema)"
                 )
 
-                continue
+            summary.append((subject["name"], len(records), added))
 
-            print(
-                "CSV:",
-                csv_url,
-            )
-
-            rows = download_csv(
-                csv_url
-            )
-
-            print(
-                f"CSV rows found: {len(rows)}"
-            )
-
-            records = convert_rows_to_records(
-                rows=rows,
-                source_url=subject["source_url"],
-            )
-
-            print(
-                f"Valid records: {len(records)}"
-            )
-
-            saved = save_records(
-                subject_id=subject["id"],
-                records=records,
-            )
-
-            print(
-                f"New records saved: {saved}"
-            )
-
-            total_saved += saved
-
-        except Exception as error:
-
-            print(
-                "IMPORT ERROR:",
-                error,
-            )
+        except Exception as error:  # keep going with other subjects
+            print("IMPORT ERROR:", error)
+            summary.append((subject["name"], 0, 0))
 
     print()
     print("=" * 70)
-    print(
-        f"TOTAL NEW RECORDS: {total_saved}"
-    )
+    print(f"{'SUBJECT':45} {'ONLINE':>8} {'NEW':>6}")
+
+    for name, found, added in summary:
+        print(f"{name[:45]:45} {found:>8} {added:>6}")
+
+    print(f"TOTAL NEW: {sum(item[2] for item in summary)}")
     print("=" * 70)
 
 
@@ -122,630 +146,329 @@ def main() -> None:
 # ============================================================
 
 def get_connection() -> sqlite3.Connection:
-
-    conn = sqlite3.connect(
-        DB_PATH
-    )
-
+    conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-
     return conn
 
 
+def backup_database() -> None:
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    target = DB_PATH.with_name(f"questions.backup-{stamp}.db")
+    shutil.copy2(DB_PATH, target)
+    print(f"Backup saved: {target.name}")
+
+
 def get_subjects():
-
     with get_connection() as conn:
-
-        rows = conn.execute(
+        return conn.execute(
             """
-            SELECT
-                id,
-                name,
-                source_url
+            SELECT id, name, source_url
             FROM subjects
-            WHERE source_url IS NOT NULL
-              AND source_url != ''
+            WHERE source_url IS NOT NULL AND source_url != ''
             ORDER BY name
             """
         ).fetchall()
 
-    return rows
 
-
-# ============================================================
-# FIND GOOGLE SHEET
-# ============================================================
-
-def find_google_sheet_csv(
-    blog_url: str,
-) -> str | None:
-
-    response = requests.get(
-        blog_url,
-        headers={
-            "User-Agent": USER_AGENT
-        },
-        timeout=TIMEOUT,
-    )
-
-    response.raise_for_status()
-
-    soup = BeautifulSoup(
-        response.text,
-        "lxml",
-    )
-
-    # --------------------------------------------------------
-    # First: look for iframe
-    # --------------------------------------------------------
-
-    for iframe in soup.find_all(
-        "iframe"
-    ):
-
-        src = iframe.get(
-            "src"
-        )
-
-        if not src:
-            continue
-
-        src = urljoin(
-            blog_url,
-            src,
-        )
-
-        if (
-            "docs.google.com/spreadsheets"
-            in src.lower()
-        ):
-
-            return convert_to_csv_url(
-                src
-            )
-
-    # --------------------------------------------------------
-    # Second: look for direct links
-    # --------------------------------------------------------
-
-    for link in soup.find_all(
-        "a"
-    ):
-
-        href = link.get(
-            "href"
-        )
-
-        if not href:
-            continue
-
-        href = urljoin(
-            blog_url,
-            href,
-        )
-
-        if (
-            "docs.google.com/spreadsheets"
-            in href.lower()
-        ):
-
-            return convert_to_csv_url(
-                href
-            )
-
-    return None
-
-
-def convert_to_csv_url(
-    published_url: str,
-) -> str:
-
-    # Example:
-    #
-    # /pubhtml?widget=true&headers=false
-    #
-    # becomes:
-    #
-    # /pub?output=csv
-
-    if "/pubhtml" in published_url:
-
-        base = published_url.split(
-            "/pubhtml",
-            1,
-        )[0]
-
-        return (
-            base
-            + "/pub?output=csv"
-        )
-
-    if "/pub?" in published_url:
-
-        base = published_url.split(
-            "/pub?",
-            1,
-        )[0]
-
-        return (
-            base
-            + "/pub?output=csv"
-        )
-
-    if published_url.endswith(
-        "/pub"
-    ):
-
-        return (
-            published_url
-            + "?output=csv"
-        )
-
-    return published_url
-
-
-# ============================================================
-# DOWNLOAD CSV
-# ============================================================
-
-def download_csv(
-    csv_url: str,
-) -> list[list[str]]:
-
-    response = requests.get(
-        csv_url,
-        headers={
-            "User-Agent": USER_AGENT
-        },
-        timeout=TIMEOUT,
-    )
-
-    response.raise_for_status()
-
-    text = response.content.decode(
-        "utf-8-sig",
-        errors="replace",
-    )
-
-    reader = csv.reader(
-        io.StringIO(text)
-    )
-
-    rows = []
-
-    for row in reader:
-
-        cleaned = [
-            clean_text(cell)
-            for cell in row
-        ]
-
-        cleaned = [
-            cell
-            for cell in cleaned
-            if cell
-        ]
-
-        if cleaned:
-
-            rows.append(
-                cleaned
-            )
-
-    return rows
-
-
-# ============================================================
-# CONVERT CSV ROWS
-# ============================================================
-
-def convert_rows_to_records(
-    rows: list[list[str]],
-    source_url: str,
-) -> list[dict[str, str]]:
-
-    if not rows:
-
-        return []
-
-    question_index, answer_index = (
-        detect_columns(rows)
-    )
-
-    print()
-    print(
-        "Detected columns:"
-    )
-
-    print(
-        f"Answer column: {answer_index}"
-    )
-
-    print(
-        f"Clue column:   {question_index}"
-    )
-
-    records = []
-
-    # --------------------------------------------------------
-    # Start from all rows.
-    #
-    # We intentionally do not blindly skip row 1 because
-    # some sheets have no header.
-    # --------------------------------------------------------
-
-    for row in rows:
-
-        if len(row) <= max(
-            question_index,
-            answer_index,
-        ):
-            continue
-
-        clue = clean_text(
-            row[question_index]
-        )
-
-        answer = clean_text(
-            row[answer_index]
-        )
-
-        if not is_valid_record(
-            clue=clue,
-            answer=answer,
-        ):
-            continue
-
-        records.append(
-            {
-                "question": clue,
-                "answer": answer,
-                "source_url": source_url,
-            }
-        )
-
-    return remove_duplicates(
-        records
-    )
-
-
-# ============================================================
-# COLUMN DETECTION
-# ============================================================
-
-def detect_columns(
-    rows: list[list[str]],
-) -> tuple[int, int]:
-
-    # --------------------------------------------------------
-    # Look for an obvious header first.
-    # --------------------------------------------------------
-
-    first_row = [
-        normalize(
-            cell
-        )
-        for cell in rows[0]
-    ]
-
-    question_keywords = {
-        "question",
-        "questions",
-        "clue",
-        "statement",
-        "description",
-        "item",
-    }
-
-    answer_keywords = {
-        "answer",
-        "answers",
-        "correct answer",
-        "key",
-        "response",
-    }
-
-    question_index = None
-    answer_index = None
-
-    for index, value in enumerate(
-        first_row
-    ):
-
-        if value in question_keywords:
-
-            question_index = index
-
-        if value in answer_keywords:
-
-            answer_index = index
-
-    if (
-        question_index is not None
-        and answer_index is not None
-    ):
-
-        return (
-            question_index,
-            answer_index,
-        )
-
-    # --------------------------------------------------------
-    # Most of Jenny's sheets use:
-    #
-    # Column 1 = Answer
-    # Column 2 = Question/Clue
-    #
-    # We verify this rather than blindly assuming it.
-    # --------------------------------------------------------
-
-    two_column_rows = [
-        row
-        for row in rows
-        if len(row) >= 2
-    ]
-
-    if two_column_rows:
-
-        first_lengths = [
-            len(row[0])
-            for row in two_column_rows
-        ]
-
-        second_lengths = [
-            len(row[1])
-            for row in two_column_rows
-        ]
-
-        first_average = mean(
-            first_lengths
-        )
-
-        second_average = mean(
-            second_lengths
-        )
-
-        # The first column is usually the short
-        # answer and the second column is the
-        # longer clue.
-        if (
-            first_average
-            < second_average
-        ):
-
-            return (
-                1,  # clue
-                0,  # answer
-            )
-
-        # If second column is shorter,
-        # assume:
-        #
-        # Column 1 = clue
-        # Column 2 = answer
-        return (
-            0,
-            1,
-        )
-
-    return (
-        1,
-        0,
-    )
-
-
-# ============================================================
-# RECORD VALIDATION
-# ============================================================
-
-def is_valid_record(
-    clue: str,
-    answer: str,
-) -> bool:
-
-    if not clue:
-        return False
-
-    if not answer:
-        return False
-
-    if len(clue) < 3:
-        return False
-
-    if len(clue) > 5000:
-        return False
-
-    if len(answer) > 2000:
-        return False
-
-    # Ignore obvious sheet headers.
-    header_values = {
-        "question",
-        "questions",
-        "answer",
-        "answers",
-        "clue",
-        "description",
-        "correct answer",
-    }
-
-    if (
-        normalize(clue)
-        in header_values
-    ):
-
-        return False
-
-    if (
-        normalize(answer)
-        in header_values
-    ):
-
-        return False
-
-    # Ignore common blog/footer noise.
-    noise = [
-        "what do you think of this blog",
-        "#sarcasticgamer",
-        "#sarcasticreview",
-        "powered by blogger",
-        "subscribe",
-        "comments",
-    ]
-
-    clue_lower = clue.lower()
-    answer_lower = answer.lower()
-
-    for item in noise:
-
-        if item in clue_lower:
-            return False
-
-        if item in answer_lower:
-            return False
-
-    # Prevent duplicate clue/answer values.
-    if normalize(clue) == normalize(answer):
-        return False
-
-    return True
-
-
-# ============================================================
-# DATABASE SAVE
-# ============================================================
-
-def save_records(
-    subject_id: int,
-    records: list[dict[str, str]],
-) -> int:
-
-    saved = 0
+def save_records(subject_id: int, records: list[dict], dry_run: bool):
+    added = existing_count = blocked = 0
 
     with get_connection() as conn:
+        known = {
+            (normalize(row["question_text"]), normalize(row["answer_text"]))
+            for row in conn.execute(
+                "SELECT question_text, answer_text FROM questions "
+                "WHERE subject_id = ?",
+                (subject_id,),
+            )
+        }
 
         for record in records:
-
-            question = clean_text(
-                record["question"]
+            key = (
+                normalize(record["question"]),
+                normalize(record["answer"]),
             )
 
-            answer = clean_text(
-                record["answer"]
-            )
+            if key in known:
+                existing_count += 1
+                continue
 
-            normalized_question = (
-                normalize(question)
-            )
+            known.add(key)
 
-            cursor = conn.execute(
-                """
-                INSERT OR IGNORE INTO questions(
-                    subject_id,
-                    question_text,
-                    normalized_question,
-                    answer_text,
-                    source_url
+            if dry_run:
+                added += 1
+                continue
+
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO questions(
+                        subject_id, question_text, normalized_question,
+                        answer_text, source_url
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        subject_id,
+                        record["question"],
+                        key[0],
+                        record["answer"],
+                        record["source_url"],
+                    ),
                 )
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (
-                    subject_id,
-                    question,
-                    normalized_question,
-                    answer,
-                    record["source_url"],
-                ),
-            )
-
-            if cursor.rowcount == 1:
-
-                saved += 1
+                added += 1
+            except sqlite3.IntegrityError:
+                blocked += 1
 
         conn.commit()
 
-    return saved
+    return added, existing_count, blocked
 
 
 # ============================================================
-# DUPLICATE REMOVAL
+# FINDING THE SHEETS
 # ============================================================
 
-def remove_duplicates(
-    records: list[dict[str, str]],
-) -> list[dict[str, str]]:
+def get_text(url: str, retries: int = 3) -> str:
+    last_error = None
 
-    unique = {}
+    for attempt in range(retries):
+        try:
+            response = SESSION.get(url, timeout=TIMEOUT)
+            response.raise_for_status()
+            return response.content.decode("utf-8-sig", errors="replace")
+        except requests.RequestException as error:
+            last_error = error
+            time.sleep(1.5 * (attempt + 1))
 
-    for record in records:
+    raise last_error  # type: ignore[misc]
 
-        key = (
-            normalize(
-                record["question"]
-            )
-        )
 
-        if not key:
+def find_sheets(blog_url: str) -> dict[str, set[str]]:
+    """All Google Sheets on the page: {sheet id: {known gids}}."""
+    html = get_text(blog_url)
+    soup = BeautifulSoup(html, "lxml")
+
+    blobs = []
+
+    for tag in soup.find_all(["iframe", "a"]):
+        link = tag.get("src") or tag.get("href")
+
+        if link:
+            blobs.append(urljoin(blog_url, link))
+
+    blobs.append(html)
+
+    sheets: dict[str, set[str]] = {}
+
+    for blob in blobs:
+        text = blob.replace("\\/", "/").replace("&amp;", "&")
+
+        for match in SHEET_RE.finditer(text):
+            sheet_id = match.group(1)
+            gids = sheets.setdefault(sheet_id, set())
+
+            found = re.search(r"gid=(\d+)", match.group(2))
+
+            if found:
+                gids.add(found.group(1))
+
+    return sheets
+
+
+def sheet_tabs(sheet_id: str, known: set[str]) -> list[str | None]:
+    """Every tab (gid) of a published sheet."""
+    gids = set(known)
+
+    try:
+        html = get_text(
+            f"https://docs.google.com/spreadsheets/d/{sheet_id}/pubhtml"
+        ).replace("&amp;", "&")
+        gids |= set(re.findall(r"gid=(\d+)", html))
+    except requests.RequestException:
+        pass
+
+    return sorted(gids, key=int) if gids else [None]
+
+
+def csv_candidates(sheet_id: str, gid: str | None) -> list[str]:
+    base = f"https://docs.google.com/spreadsheets/d/{sheet_id}"
+    query = f"gid={gid}&single=true&" if gid is not None else ""
+
+    urls = [f"{base}/pub?{query}output=csv"]
+
+    if not sheet_id.startswith("e/"):
+        suffix = f"&gid={gid}" if gid is not None else ""
+        urls.append(f"{base}/export?format=csv{suffix}")
+
+    return urls
+
+
+def download_rows(sheet_id: str, gid: str | None) -> list[list[str]]:
+    for url in csv_candidates(sheet_id, gid):
+        try:
+            text = get_text(url)
+        except requests.RequestException:
             continue
 
-        unique.setdefault(
-            key,
-            record,
-        )
+        if re.match(r"\s*<(!doctype|html)", text, re.IGNORECASE):
+            continue
 
-    return list(
-        unique.values()
-    )
+        rows = []
+
+        for row in csv.reader(io.StringIO(text)):
+            cells = [clean_text(cell) for cell in row]
+
+            if any(cells):
+                rows.append(cells)
+
+        if rows:
+            return rows
+
+    return []
 
 
 # ============================================================
-# TEXT UTILITIES
+# CONVERTING ROWS
 # ============================================================
 
-def clean_text(
-    value: str,
-) -> str:
+def collect_records(blog_url: str) -> list[dict]:
+    sheets = find_sheets(blog_url)
 
-    value = value.replace(
-        "\u00a0",
-        " ",
+    if not sheets:
+        print("No Google Sheet found on this page.")
+        return []
+
+    records: list[dict] = []
+
+    for sheet_id, known in sheets.items():
+        for gid in sheet_tabs(sheet_id, known):
+            rows = download_rows(sheet_id, gid)
+            label = f"{sheet_id[:14]}... tab {gid}"
+            print(f"  {label}: {len(rows)} rows")
+
+            if rows:
+                records.extend(rows_to_records(rows, blog_url))
+
+            time.sleep(0.3)
+
+    return remove_duplicates(records)
+
+
+def detect_layout(rows: list[list[str]]):
+    """
+    Returns (question_index, answer_index) when the sheet has a
+    header row, otherwise (None, answer_first).
+    """
+    header = [normalize(cell) for cell in rows[0]]
+
+    q_index = next(
+        (i for i, v in enumerate(header) if v in QUESTION_HEADERS), None
     )
+    a_index = next(
+        (i for i, v in enumerate(header) if v in ANSWER_HEADERS), None
+    )
+
+    if q_index is not None and a_index is not None:
+        return q_index, a_index
+
+    # No header: vote row by row. The answer is usually the SHORTER
+    # cell, the clue the longer one.
+    votes_answer_first = votes_clue_first = 0
+
+    for row in rows:
+        cells = [c for c in row if c][:2]
+
+        if len(cells) < 2:
+            continue
+
+        if len(cells[0]) < len(cells[1]):
+            votes_answer_first += 1
+        elif len(cells[0]) > len(cells[1]):
+            votes_clue_first += 1
+
+    return None, votes_answer_first >= votes_clue_first
+
+
+def rows_to_records(rows: list[list[str]], source_url: str) -> list[dict]:
+    q_index, second = detect_layout(rows)
+    records = []
+
+    for row in rows:
+        if q_index is not None:
+            a_index = second
+
+            if len(row) <= max(q_index, a_index):
+                continue
+
+            clue, answer = row[q_index], row[a_index]
+        else:
+            # Empty cells are skipped only to find the first TWO
+            # filled cells (the rest of the row is ignored).
+            cells = [c for c in row if c][:2]
+
+            if len(cells) < 2:
+                continue
+
+            answer, clue = (cells if second else cells[::-1])
+
+        if is_valid_record(clue, answer):
+            records.append(
+                {"question": clue, "answer": answer,
+                 "source_url": source_url}
+            )
+
+    return records
+
+
+def is_valid_record(clue: str, answer: str) -> bool:
+    if not clue or not answer:
+        return False
+
+    if len(clue) < 3 or len(clue) > 5000 or len(answer) > 2000:
+        return False
+
+    if normalize(clue) in HEADER_WORDS or normalize(answer) in HEADER_WORDS:
+        return False
+
+    low = f"{clue} {answer}".lower()
+
+    if any(phrase in low for phrase in NOISE_PHRASES):
+        return False
+
+    return normalize(clue) != normalize(answer)
+
+
+def remove_duplicates(records: list[dict]) -> list[dict]:
+    """Same clue with a DIFFERENT answer is kept (both are useful)."""
+    unique: dict = {}
+
+    for record in records:
+        key = (normalize(record["question"]), normalize(record["answer"]))
+
+        if key[0] and key[1]:
+            unique.setdefault(key, record)
+
+    return list(unique.values())
+
+
+# ============================================================
+# TEXT UTILITIES (same rules as backend/app.py)
+# ============================================================
+
+def clean_text(value: str) -> str:
+    return re.sub(r"\s+", " ", value.replace("\u00a0", " ")).strip()
+
+
+def normalize(value: str) -> str:
+    value = clean_text(value).lower()
 
     value = re.sub(
-        r"\s+",
-        " ",
-        value,
+        r"^\s*(?:q(?:uestion)?\s*)?\d+\s*[\.\):\-]?\s*", "", value
     )
+    value = re.sub(r"[^a-z0-9\s]", " ", value)
 
-    return value.strip()
+    return re.sub(r"\s+", " ", value).strip()
 
-
-def normalize(
-    value: str,
-) -> str:
-
-    value = clean_text(
-        value
-    ).lower()
-
-    value = re.sub(
-        r"[^a-z0-9\s]",
-        " ",
-        value,
-    )
-
-    value = re.sub(
-        r"\s+",
-        " ",
-        value,
-    )
-
-    return value.strip()
-
-
-# ============================================================
-# PROGRAM ENTRY
-# ============================================================
 
 if __name__ == "__main__":
     main()

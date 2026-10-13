@@ -24,6 +24,7 @@ SUBJECTS = [
         "Capstone 2",
         "capstone-2",
         "https://jennysonline.blogspot.com/2023/07/it-capstone-project-2.html",
+        "https://amauoed.com/courses/it/it-capstone-project-1-6398-it"
     ),
     (
         "Art Appreciation",
@@ -36,9 +37,13 @@ SUBJECTS = [
         "https://jennysonline.blogspot.com/2021/03/cloud-computing-and-internet-of-things.html",
     ),
     (
-        "Reading in the Philippine History",
-        "reading-in-the-philippine-history",
+        "Readings in the Philippine History",
+        "readings-in-the-philippine-history",
         "https://jennysonline.blogspot.com/2021/03/readings-in-philippine-history.html",
+    ),
+    (
+        "Technopreneurship",
+        "https://amauoed.com/courses/ite/technopreneurship-6301-ite",
     ),
 ]
 
