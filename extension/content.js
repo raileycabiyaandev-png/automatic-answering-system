@@ -23,7 +23,7 @@ const ALLOWED_HOSTS = [
     "127.0.0.1",
     "automatic-answering-system.onrender.com",
     "semestral.amaes.com",
-    "semestralexam.amaes.com",
+    "semestralexam.amaes.com"
 ];
 
 let enabled = false;
@@ -158,7 +158,9 @@ function shouldResume() {
 
 // Send a message to background.js. Never waits forever and gives a
 // clear message if the extension was reloaded.
-function sendToBackground(message, timeoutMs = BACKGROUND_TIMEOUT_MS) {
+// CHANGED: if the background worker was asleep or restarted
+// ("message channel closed"), it wakes it up and asks again.
+function sendToBackground(message, timeoutMs = BACKGROUND_TIMEOUT_MS, attempt = 0) {
     return new Promise((resolve, reject) => {
         let finished = false;
 
@@ -199,6 +201,29 @@ function sendToBackground(message, timeoutMs = BACKGROUND_TIMEOUT_MS) {
                 const lastError = chrome.runtime.lastError;
 
                 if (lastError) {
+                    const text = String(lastError.message || "");
+
+                    // The background worker went to sleep or restarted
+                    // while it was working. Wake it up and ask again.
+                    if (
+                        attempt < 2 &&
+                        /message channel closed|receiving end does not exist|port closed/i
+                            .test(text)
+                    ) {
+                        finished = true;
+                        clearTimeout(timer);
+
+                        setTimeout(() => {
+                            sendToBackground(
+                                message,
+                                timeoutMs,
+                                attempt + 1
+                            ).then(resolve, reject);
+                        }, 700 * (attempt + 1));
+
+                        return;
+                    }
+
                     fail(lastError);
                     return;
                 }
@@ -615,7 +640,7 @@ async function detectCurrentQuestion() {
 // Database first, then Gemini. Throws when no answer could be
 // obtained, so the caller can try again.
 async function lookupAndShow(candidate) {
-    // CHANGED: uses lookupDatabase, which also tries the text
+    // Uses lookupDatabase, which also tries the text
     // before / after an answer box.
     const match = await lookupDatabase(candidate);
 
@@ -657,18 +682,20 @@ async function lookupAndShow(candidate) {
 }
 
 
-// A database answer is only useful if it points to one of
-// the choices on the page. If not, we ask Gemini instead.
+// A database answer is only useful if it points to at least one
+// of the choices on the page. If not, we ask Gemini instead.
+// CHANGED: works for several answers (checkboxes) too.
 function answerFitsChoices(candidate, match) {
     if (!candidate.choices || candidate.choices.length === 0) {
         return true;
     }
 
-    return choiceIndexFor(
+    return choiceIndexesFor(
         candidate.choices,
         match.answer,
-        match
-    ) !== -1;
+        match,
+        candidate.multi
+    ).length > 0;
 }
 
 
@@ -741,23 +768,11 @@ function displayStudyHelpResult(candidate, result, allowAuto = true) {
         return;
     }
 
-    // Prefer the choice that the backend already picked.
-    let suggestedChoice = null;
+    // CHANGED: shows ALL the choices the answer points to.
+    const picked = pickedChoiceText(candidate, result.answer, result);
 
-    if (
-        Number.isInteger(result.choice_index) &&
-        candidate.choices[result.choice_index]
-    ) {
-        suggestedChoice = candidate.choices[result.choice_index];
-    } else {
-        suggestedChoice = findChoiceForAnswer(
-            result.answer,
-            candidate.choices
-        );
-    }
-
-    const choiceText = suggestedChoice
-        ? `Likely matching choice: ${suggestedChoice}`
+    const choiceText = picked
+        ? `Likely matching choice: ${picked}`
         : "No clear choice match. Review the options manually.";
 
     const sources = Array.isArray(result.sources)
@@ -1022,7 +1037,7 @@ function selectMatchingOption(candidate, answer, result) {
 
 
 // ============================================================
-// NEW: ITEMS WITH AN ANSWER BOX (identification / fill in the
+// ITEMS WITH AN ANSWER BOX (identification / fill in the
 // blank). The database is also searched with the text that sits
 // right BEFORE the box and the text that sits right AFTER it,
 // because the stored question may only match one of those parts.
@@ -1280,6 +1295,11 @@ function buildCandidate(element) {
 
     const choices = extractChoices(element);
 
+    // NEW: checkboxes ("Select one or more") can have several answers.
+    const multi = realChoiceInputs(element).some(
+        (input) => input.type === "checkbox"
+    );
+
     let score = 0;
 
     if (question.endsWith("?")) {
@@ -1298,10 +1318,11 @@ function buildCandidate(element) {
         question,
         choices,
         element,
-        score
+        score,
+        multi
     };
 
-    // NEW: an item with an answer box also gets extra search
+    // An item with an answer box also gets extra search
     // phrases (the text before / after the box).
     if (choices.length === 0) {
         candidate.altQuestions = buildBlankQueries(element);
@@ -1418,11 +1439,13 @@ function realChoiceInputs(root) {
 }
 
 
-// Extract choices from labels or text such as "A. Example".
-function extractChoices(element) {
-    const choices = [];
+// NEW: every real radio button / checkbox together with its label
+// text. Choices and inputs stay in the SAME order, so a choice
+// number always points to the right input.
+function choiceItems(root) {
+    const items = [];
 
-    for (const input of realChoiceInputs(element)) {
+    for (const input of realChoiceInputs(root)) {
         const label = findLabel(input);
 
         if (!label) {
@@ -1434,16 +1457,26 @@ function extractChoices(element) {
         );
 
         if (text) {
-            choices.push(text);
+            items.push({ input, text });
         }
     }
 
-    if (choices.length >= 2) {
-        return unique(choices).slice(0, 20);
+    return items;
+}
+
+
+// Extract choices from labels or text such as "A. Example".
+function extractChoices(element) {
+    const items = choiceItems(element);
+
+    if (items.length >= 2) {
+        return items.map((item) => item.text).slice(0, 20);
     }
 
     // Fallback for questions that use plain text instead
     // of radio buttons or checkbox labels.
+    const choices = [];
+
     for (const line of getTextLines(element)) {
         if (/^[A-H]\s*[\.\):\-]/i.test(line)) {
             choices.push(line);
@@ -1562,8 +1595,11 @@ function displayMatchResult(candidate, result, allowAuto = true) {
         return;
     }
 
-    const choice = result.choice_label
-        ? `Choice: ${result.choice_label}`
+    // CHANGED: shows ALL the choices the answer points to.
+    const picked = pickedChoiceText(candidate, result.answer, result);
+
+    const choice = picked
+        ? `Choice: ${picked}`
         : "No matching choice identified.";
 
     const lines = [
@@ -1576,7 +1612,7 @@ function displayMatchResult(candidate, result, allowAuto = true) {
         `Confidence: ${Math.round(result.confidence * 100)}%`
     ];
 
-    // NEW: tell which part of the question found the answer.
+    // Tell which part of the question found the answer.
     if (result.searched_text) {
         lines.push("", "Found using:", result.searched_text);
     }
@@ -1606,11 +1642,11 @@ function formatDetectedQuestion(candidate) {
         "QUESTION DETECTED",
         candidate.question,
         "",
-        "CHOICES",
+        candidate.multi ? "CHOICES (select one or more)" : "CHOICES",
         choicesText
     ];
 
-    // NEW: show the extra search phrases for items with a box.
+    // Show the extra search phrases for items with a box.
     const extra = questionVariants(candidate).slice(1);
 
     if (extra.length > 0) {
@@ -1877,6 +1913,18 @@ function findBlocksFromContainers() {
 }
 
 
+// NEW: radio buttons of one question share the same name, but
+// checkboxes each have their own name (..._choice0, ..._choice1).
+// This gives all the checkboxes of one question the same key.
+function choiceGroupKey(input) {
+    const name = input.name || "__no_name__";
+
+    return input.type === "checkbox"
+        ? name.replace(/_?choice\d+$/i, "") || name
+        : name;
+}
+
+
 // Way 2: pages without special classes. Every group of radio
 // buttons (same name) is treated as one question.
 function findBlocksFromChoiceGroups() {
@@ -1888,7 +1936,7 @@ function findBlocksFromChoiceGroups() {
     const groups = new Map();
 
     for (const input of inputs) {
-        const key = input.name || "__no_name__";
+        const key = choiceGroupKey(input);
 
         if (!groups.has(key)) {
             groups.set(key, []);
@@ -2035,7 +2083,7 @@ async function withRequestSlot(task) {
 
 
 // Ask the database (fast).
-// CHANGED: for items with an answer box it tries the full question
+// For items with an answer box it tries the full question
 // first, then the text before / after the box. It stops at the
 // first phrase that gives a usable match.
 async function lookupDatabase(candidate) {
@@ -2423,7 +2471,7 @@ async function startRunner() {
                             }
 
                             if (enabled && autoAnswer && autoScroll) {
-                                // CHANGED: different text for the
+                                // Different text for the
                                 // "Finish attempt" button.
                                 const goingText = isFinishButton(nextButton)
                                     ? "Opening the summary page (Finish attempt).\n" +
@@ -2749,7 +2797,7 @@ function performAnswer(candidate, answer, result) {
     }
 
     if (candidate.choices.length > 0) {
-        // Multiple choice.
+        // Multiple choice (one or several answers).
         return selectMatchingChoice(candidate, answer, result);
     }
 
@@ -2880,7 +2928,7 @@ function canContinue() {
 
 // Click a "Next" button. The page may reload, so we leave a
 // small note that lets the extension continue by itself.
-// CHANGED: "Finish attempt" is allowed (it only opens the summary
+// "Finish attempt" is allowed (it only opens the summary
 // page). A button that SUBMITS the quiz is never clicked.
 function clickNext(button) {
     if (isSubmitButton(button)) {
@@ -3072,11 +3120,11 @@ function findNextButton() {
 
 
 // ============================================================
-// MULTIPLE CHOICE
+// MULTIPLE CHOICE (ONE answer or SEVERAL answers)
 // ============================================================
 
-// Finds WHICH choice the answer points to. Returns -1 when
-// no choice fits.
+// Finds WHICH single choice the answer points to. Returns -1
+// when no choice fits. Used for radio buttons and drop-downs.
 function choiceIndexFor(choices, answer, result) {
     result = result || {};
 
@@ -3166,6 +3214,142 @@ function choiceIndexFor(choices, answer, result) {
 }
 
 
+// NEW: all the pieces an answer can be made of: the answer itself,
+// every answer the backend sent, and each of them split into
+// lines / items ("Apple, Banana" or one item per line).
+function answerPieces(answer, result) {
+    const sources = [answer];
+
+    if (result && Array.isArray(result.answers)) {
+        sources.push(...result.answers);
+    }
+
+    const pieces = [];
+
+    for (const source of sources) {
+        const text = String(source || "").trim();
+
+        if (!text) {
+            continue;
+        }
+
+        pieces.push(text);
+        pieces.push(...splitAnswerItems(text));
+    }
+
+    return unique(pieces.filter(Boolean));
+}
+
+
+// NEW: finds EVERY choice the answer points to.
+// One-answer questions (radio buttons) give at most one index.
+function choiceIndexesFor(choices, answer, result, multi) {
+    result = result || {};
+
+    if (!choices || choices.length === 0) {
+        return [];
+    }
+
+    if (!multi) {
+        const single = choiceIndexFor(choices, answer, result);
+
+        return single === -1 ? [] : [single];
+    }
+
+    const pieces = answerPieces(answer, result);
+    const stripped = choices.map((choice) =>
+        normalize(stripChoicePrefix(choice))
+    );
+
+    const found = new Set();
+
+    // 1. A piece that is exactly a choice text or a letter.
+    for (const piece of pieces) {
+        const wanted = normalize(piece);
+
+        if (!wanted) {
+            continue;
+        }
+
+        stripped.forEach((text, index) => {
+            if (text && text === wanted) {
+                found.add(index);
+            }
+        });
+
+        const letter = piece.trim().match(/^(?:option\s+)?([A-H])$/i);
+
+        if (letter) {
+            const index = letter[1].toUpperCase().charCodeAt(0) - 65;
+
+            if (index < choices.length) {
+                found.add(index);
+            }
+        }
+    }
+
+    // 2. A choice text that appears as whole words inside the
+    //    answer text (for "Cloud Computing and M2M").
+    const haystack = ` ${normalize(pieces.join(" "))} `;
+    const inside = [];
+
+    stripped.forEach((text, index) => {
+        if (text.length >= 3 && haystack.includes(` ${text} `)) {
+            inside.push(index);
+        }
+    });
+
+    for (const index of inside) {
+        // "Computing" is ignored when "Cloud Computing" also fits.
+        const hiddenInLonger = inside.some(
+            (other) =>
+                other !== index &&
+                stripped[other].length > stripped[index].length &&
+                ` ${stripped[other]} `.includes(` ${stripped[index]} `)
+        );
+
+        if (!hiddenInLonger || found.has(index)) {
+            found.add(index);
+        }
+    }
+
+    // 3. Nothing clear: use the backend's pick, then the fuzzy match.
+    if (found.size === 0) {
+        if (
+            Number.isInteger(result.choice_index) &&
+            result.choice_index >= 0 &&
+            result.choice_index < choices.length
+        ) {
+            found.add(result.choice_index);
+        }
+
+        for (const piece of pieces) {
+            const index = choiceIndexFor(choices, piece, {});
+
+            if (index !== -1) {
+                found.add(index);
+            }
+        }
+    }
+
+    return Array.from(found).sort((a, b) => a - b);
+}
+
+
+// NEW: readable list of the chosen answers, for the overlay.
+function pickedChoiceText(candidate, answer, result) {
+    const choices = candidate.choices || [];
+
+    if (choices.length === 0) {
+        return "";
+    }
+
+    return choiceIndexesFor(choices, answer, result, candidate.multi)
+        .map((index) => clean(stripChoicePrefix(choices[index])))
+        .join("; ");
+}
+
+
 // Tick a radio button or checkbox in the safest way.
 function checkInput(input) {
     if (input.checked) {
@@ -3198,6 +3382,7 @@ function checkInput(input) {
 }
 
 
+// CHANGED: ticks EVERY choice that the answer points to.
 function selectMatchingChoice(candidate, answer, result) {
     const choices = candidate.choices || [];
 
@@ -3205,56 +3390,69 @@ function selectMatchingChoice(candidate, answer, result) {
         return null;
     }
 
-    const choiceIndex = choiceIndexFor(choices, answer, result);
+    const indexes = choiceIndexesFor(
+        choices,
+        answer,
+        result,
+        candidate.multi
+    );
 
-    if (choiceIndex === -1) {
+    if (indexes.length === 0) {
         return null;
     }
 
-    const chosenText = choices[choiceIndex];
-    const wantedText = normalize(stripChoicePrefix(chosenText));
+    const items = choiceItems(candidate.element);
+    const applied = [];
 
-    const inputs = realChoiceInputs(candidate.element)
-        .filter((input) => !input.disabled);
+    for (const index of indexes) {
+        const chosenText = choices[index];
+        const wantedText = normalize(stripChoicePrefix(chosenText));
 
-    let input = inputs.find((item) => {
-        const label = findLabel(item);
-        const labelText = label
-            ? label.innerText || label.textContent || ""
-            : item.value || "";
+        // Same position first, then the same text.
+        let item = items[index];
 
-        return normalize(stripChoicePrefix(labelText)) === wantedText;
-    });
-
-    if (!input && inputs[choiceIndex]) {
-        input = inputs[choiceIndex];
-    }
-
-    if (input) {
-        const ok = checkInput(input);
-
-        // If the page re-drew the radio button, the old one is no
-        // longer on the page. That is not a failure.
-        if (!ok && input.isConnected) {
-            return null;
+        if (
+            !item ||
+            normalize(stripChoicePrefix(item.text)) !== wantedText
+        ) {
+            item = items.find(
+                (other) =>
+                    normalize(stripChoicePrefix(other.text)) === wantedText
+            ) || null;
         }
 
-        return clean(stripChoicePrefix(chosenText)) || String(answer);
+        let done = false;
+
+        if (item) {
+            if (item.input.disabled) {
+                continue;
+            }
+
+            // If the page re-drew the input, the old one is no
+            // longer on the page. That is not a failure.
+            done = checkInput(item.input) || !item.input.isConnected;
+        } else {
+            // No radio/checkbox: the page may use buttons or
+            // clickable boxes for its choices.
+            const clickable = findClickableChoice(
+                candidate.element,
+                wantedText
+            );
+
+            if (clickable) {
+                clickable.click();
+                done = true;
+            }
+        }
+
+        if (done) {
+            applied.push(
+                clean(stripChoicePrefix(chosenText)) || String(answer)
+            );
+        }
     }
 
-    // No radio/checkbox found: the page may use buttons or
-    // clickable boxes for its choices.
-    const clickable = findClickableChoice(
-        candidate.element,
-        wantedText
-    );
-
-    if (clickable) {
-        clickable.click();
-        return clean(stripChoicePrefix(chosenText)) || String(answer);
-    }
-
-    return null;
+    return applied.length > 0 ? applied.join("; ") : null;
 }
 
 
