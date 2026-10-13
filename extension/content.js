@@ -614,27 +614,14 @@ async function detectCurrentQuestion() {
 // Database first, then Gemini. Throws when no answer could be
 // obtained, so the caller can try again.
 async function lookupAndShow(candidate) {
-    const response = await sendToBackground({
-        type: "MATCH_QUESTION",
-        payload: {
-            subject,
-            question: candidate.question,
-            choices: candidate.choices
-        }
-    });
-
-    if (!response || !response.ok) {
-        throw new Error(
-            response?.error || "Database matching failed."
-        );
-    }
+    // CHANGED: uses lookupDatabase, which also tries the text
+    // before / after an answer box.
+    const match = await lookupDatabase(candidate);
 
     // The user pressed Stop while we were waiting.
     if (!enabled) {
         return;
     }
-
-    const match = response.result;
 
     if (!match) {
         throw new Error(
@@ -901,7 +888,7 @@ function insideMoodleQuestion(element) {
 
 
 // ============================================================
-// NEW: MATCHING QUESTIONS (a table of rows, each with a
+// MATCHING QUESTIONS (a table of rows, each with a
 // drop-down list). Moodle's "match" question type.
 //
 // Each ROW is treated as its own multiple choice question:
@@ -1033,6 +1020,155 @@ function selectMatchingOption(candidate, answer, result) {
 }
 
 
+// ============================================================
+// NEW: ITEMS WITH AN ANSWER BOX (identification / fill in the
+// blank). The database is also searched with the text that sits
+// right BEFORE the box and the text that sits right AFTER it,
+// because the stored question may only match one of those parts.
+// ============================================================
+
+// The text boxes of a question that can really be filled in.
+function visibleTextFields(root) {
+    return Array.from(
+        root.querySelectorAll(
+            "input:not([type]), input[type='text'], " +
+            "input[type='search'], textarea"
+        )
+    ).filter((field) =>
+        !field.disabled &&
+        !field.readOnly &&
+        isVisible(field)
+    );
+}
+
+
+// Readable text of a piece of the page. Hidden helper text
+// (screen reader labels), inputs and drop-downs are removed.
+function cleanFragmentText(node) {
+    const box = document.createElement("div");
+
+    box.appendChild(node);
+
+    box.querySelectorAll(
+        ".accesshide, .sr-only, script, style, " +
+        "input, select, textarea, option"
+    ).forEach((item) => item.remove());
+
+    // Keep words from touching each other between paragraphs.
+    box.querySelectorAll("p, br, div, li, tr, td").forEach((item) => {
+        item.after(" ");
+    });
+
+    return clean(
+        (box.textContent || "").replace(/_{2,}/g, " ")
+    );
+}
+
+
+// Text before and text after a box, inside one container.
+function textAround(scope, field) {
+    const beforeRange = document.createRange();
+    beforeRange.setStart(scope, 0);
+    beforeRange.setEndBefore(field);
+
+    const afterRange = document.createRange();
+    afterRange.setStartAfter(field);
+    afterRange.setEnd(scope, scope.childNodes.length);
+
+    return [
+        cleanFragmentText(beforeRange.cloneContents()),
+        cleanFragmentText(afterRange.cloneContents())
+    ];
+}
+
+
+function splitSentences(text) {
+    return String(text || "")
+        .split(/(?<=[.!?])\s+/)
+        .map(clean)
+        .filter(Boolean);
+}
+
+
+// Search phrases for an item with an answer box, best first:
+//   1. the sentence right before the box
+//   2. the first sentence before the box
+//   3. all the text before the box
+//   4. the sentence right after the box
+//   5. the last sentence after the box
+//   6. all the text after the box
+function buildBlankQueries(element) {
+    const field = visibleTextFields(element)[0];
+
+    if (!field) {
+        return [];
+    }
+
+    let before = "";
+    let after = "";
+
+    const textBoxes = element.querySelectorAll(
+        ".qtext, .question-text"
+    );
+
+    if (textBoxes.length === 1) {
+        const box = textBoxes[0];
+
+        if (box.contains(field)) {
+            // The box is INSIDE the sentence (fill in the blank).
+            [before, after] = textAround(box, field);
+        } else {
+            // The box is under the question text.
+            before = cleanFragmentText(box.cloneNode(true));
+        }
+    } else {
+        [before, after] = textAround(element, field);
+    }
+
+    const beforeSentences = splitSentences(before);
+    const afterSentences = splitSentences(after);
+
+    const phrases = [
+        beforeSentences[beforeSentences.length - 1],
+        beforeSentences[0],
+        before,
+        afterSentences[0],
+        afterSentences[afterSentences.length - 1],
+        after
+    ];
+
+    return phrases
+        .map((phrase) => clean(phrase || "").slice(0, 500))
+        .filter((phrase) => phrase.length >= 4);
+}
+
+
+// The question itself first, then the extra search phrases.
+// Duplicates are removed.
+function questionVariants(candidate) {
+    const all = [
+        candidate.question,
+        ...(candidate.altQuestions || [])
+    ];
+
+    const seen = new Set();
+    const result = [];
+
+    for (const text of all) {
+        const key = normalize(text);
+
+        if (!key || seen.has(key)) {
+            continue;
+        }
+
+        seen.add(key);
+        result.push(text);
+    }
+
+    return result;
+}
+
+
 // Collect possible question containers from the page.
 function findBestQuestionCandidate() {
     const selectors = [
@@ -1069,7 +1205,7 @@ function findBestQuestionCandidate() {
                 continue;
             }
 
-            // NEW: matching questions are handled row by row.
+            // Matching questions are handled row by row.
             if (isMatchContainer(element)) {
                 continue;
             }
@@ -1091,7 +1227,7 @@ function findBestQuestionCandidate() {
         }
     }
 
-    // NEW: every row of a matching question is a candidate.
+    // Every row of a matching question is a candidate.
     for (const row of matchRows(document)) {
         if (
             row.closest(`#${OVERLAY_ID}`) ||
@@ -1130,7 +1266,7 @@ function findBestQuestionCandidate() {
 
 
 function buildCandidate(element) {
-    // NEW: a table row with a drop-down is a matching question row.
+    // A table row with a drop-down is a matching question row.
     if (element.matches && element.matches("tr")) {
         return buildMatchRowCandidate(element);
     }
@@ -1157,12 +1293,20 @@ function buildCandidate(element) {
         score += 10;
     }
 
-    return {
+    const candidate = {
         question,
         choices,
         element,
         score
     };
+
+    // NEW: an item with an answer box also gets extra search
+    // phrases (the text before / after the box).
+    if (choices.length === 0) {
+        candidate.altQuestions = buildBlankQueries(element);
+    }
+
+    return candidate;
 }
 
 
@@ -1421,21 +1565,28 @@ function displayMatchResult(candidate, result, allowAuto = true) {
         ? `Choice: ${result.choice_label}`
         : "No matching choice identified.";
 
-    showOverlay(
-        [
-            "QUESTION DETECTED",
-            candidate.question,
-            "",
-            "MATCHED ANSWER",
-            result.answer || "(empty answer)",
-            choice,
-            `Confidence: ${Math.round(result.confidence * 100)}%`,
-            "",
-            "Source:",
-            result.source_url || "Local question database"
-        ].join("\n"),
-        "success"
+    const lines = [
+        "QUESTION DETECTED",
+        candidate.question,
+        "",
+        "MATCHED ANSWER",
+        result.answer || "(empty answer)",
+        choice,
+        `Confidence: ${Math.round(result.confidence * 100)}%`
+    ];
+
+    // NEW: tell which part of the question found the answer.
+    if (result.searched_text) {
+        lines.push("", "Found using:", result.searched_text);
+    }
+
+    lines.push(
+        "",
+        "Source:",
+        result.source_url || "Local question database"
     );
+
+    showOverlay(lines.join("\n"), "success");
 
     if (allowAuto) {
         autoAnswerCandidate(candidate, result.answer, result);
@@ -1450,13 +1601,26 @@ function formatDetectedQuestion(candidate) {
             .join("\n")
         : "No choices detected.";
 
-    return [
+    const lines = [
         "QUESTION DETECTED",
         candidate.question,
         "",
         "CHOICES",
         choicesText
-    ].join("\n");
+    ];
+
+    // NEW: show the extra search phrases for items with a box.
+    const extra = questionVariants(candidate).slice(1);
+
+    if (extra.length > 0) {
+        lines.push(
+            "",
+            "ALSO SEARCHING WITH",
+            ...extra.map((text, index) => `${index + 1}. ${text}`)
+        );
+    }
+
+    return lines.join("\n");
 }
 
 
@@ -1669,7 +1833,7 @@ function findBlocksFromContainers() {
             continue;
         }
 
-        // NEW: a matching question is not one block. Its ROWS are.
+        // A matching question is not one block. Its ROWS are.
         if (isMatchContainer(element)) {
             continue;
         }
@@ -1681,7 +1845,7 @@ function findBlocksFromContainers() {
         }
     }
 
-    // NEW: every row of every matching question is a block.
+    // Every row of every matching question is a block.
     for (const row of matchRows(document)) {
         if (
             row.closest(`#${OVERLAY_ID}`) ||
@@ -1697,7 +1861,7 @@ function findBlocksFromContainers() {
         }
     }
 
-    // NEW: keep the blocks in the same order as on the page.
+    // Keep the blocks in the same order as on the page.
     found.sort((a, b) => {
         if (a.element === b.element) {
             return 0;
@@ -1870,29 +2034,73 @@ async function withRequestSlot(task) {
 
 
 // Ask the database (fast).
+// CHANGED: for items with an answer box it tries the full question
+// first, then the text before / after the box. It stops at the
+// first phrase that gives a usable match.
 async function lookupDatabase(candidate) {
-    const response = await sendToBackground({
-        type: "MATCH_QUESTION",
-        payload: {
-            subject,
-            question: candidate.question,
-            choices: candidate.choices
+    const variants = questionVariants(candidate);
+
+    let firstResult = null;
+
+    for (let index = 0; index < variants.length; index++) {
+        const text = variants[index];
+        let result;
+
+        try {
+            const response = await sendToBackground({
+                type: "MATCH_QUESTION",
+                payload: {
+                    subject,
+                    question: text,
+                    choices: candidate.choices
+                }
+            });
+
+            if (!response || !response.ok) {
+                throw new Error(
+                    response?.error || "Database matching failed."
+                );
+            }
+
+            if (!response.result) {
+                throw new Error(
+                    "The backend returned no matching result."
+                );
+            }
+
+            result = response.result;
+        } catch (error) {
+            // A problem with the FIRST request is a real failure
+            // (the caller will try again). Later phrases that fail
+            // are simply skipped.
+            if (index === 0) {
+                throw error;
+            }
+
+            continue;
         }
-    });
 
-    if (!response || !response.ok) {
-        throw new Error(
-            response?.error || "Database matching failed."
-        );
+        if (result.match_type === "subject_not_found") {
+            return result;
+        }
+
+        if (result.matched && answerFitsChoices(candidate, result)) {
+            return index === 0
+                ? result
+                : { ...result, searched_text: text };
+        }
+
+        if (!firstResult) {
+            firstResult = result;
+        }
+
+        // The user pressed Stop: do not search any further.
+        if (!enabled) {
+            break;
+        }
     }
 
-    if (!response.result) {
-        throw new Error(
-            "The backend returned no matching result."
-        );
-    }
-
-    return response.result;
+    return firstResult;
 }
 
 
@@ -2214,8 +2422,16 @@ async function startRunner() {
                             }
 
                             if (enabled && autoAnswer && autoScroll) {
+                                // CHANGED: different text for the
+                                // "Finish attempt" button.
+                                const goingText = isFinishButton(nextButton)
+                                    ? "Opening the summary page (Finish attempt).\n" +
+                                      "Nothing is submitted. Press\n" +
+                                      "\"Submit all and finish\" yourself."
+                                    : "Going to the next page...";
+
                                 showOverlay(
-                                    "ALL QUESTIONS ANSWERED\n\nGoing to the next page...",
+                                    `ALL QUESTIONS ANSWERED\n\n${goingText}`,
                                     "success"
                                 );
 
@@ -2526,7 +2742,7 @@ function autoAnswerCandidate(candidate, answer, result = {}) {
 
 // Select a choice, pick a drop-down option, or type into a text box.
 function performAnswer(candidate, answer, result) {
-    // NEW: a row of a matching question (drop-down list).
+    // A row of a matching question (drop-down list).
     if (candidate.select) {
         return selectMatchingOption(candidate, answer, result);
     }
@@ -2663,13 +2879,45 @@ function canContinue() {
 
 // Click a "Next" button. The page may reload, so we leave a
 // small note that lets the extension continue by itself.
+// CHANGED: "Finish attempt" is allowed (it only opens the summary
+// page). A button that SUBMITS the quiz is never clicked.
 function clickNext(button) {
+    if (isSubmitButton(button)) {
+        console.warn("[QAA DEBUG] Refused to click a Submit button.");
+        return;
+    }
+
+    if (isFinishButton(button)) {
+        // The summary page has no questions. Do not resume there.
+        clearResume();
+        stopAfterFinish();
+        button.click();
+        return;
+    }
+
     markResume();
 
     // If the page did not reload, remove the note again.
     setTimeout(clearResume, 8000);
 
     button.click();
+}
+
+
+// After "Finish attempt" the assistant stops by itself, so it
+// does nothing on the summary page.
+function stopAfterFinish() {
+    enabled = false;
+
+    clearTimeout(detectionTimer);
+    clearTimeout(answerTimer);
+    clearTimeout(followUpTimer);
+    clearTimeout(scrollTimer);
+    clearTimeout(retryTimer);
+
+    answerTimer = null;
+    followUpTimer = null;
+    retryTimer = null;
 }
 
 
@@ -2751,37 +2999,51 @@ function isDisabledElement(element) {
 }
 
 
-// NEW: buttons that end the quiz are never clicked automatically.
-function isFinishButton(element) {
+function buttonLabel(element) {
     const raw = element instanceof HTMLInputElement
         ? element.value
         : element.textContent;
 
-    return /\b(finish|submit)\b/i.test(clean(raw || ""));
+    return clean(raw || "");
+}
+
+
+// "Finish attempt ..." only opens the summary page in Moodle.
+// It does NOT submit the answers, so it may be clicked.
+function isFinishButton(element) {
+    return /\bfinish\b/i.test(buttonLabel(element)) &&
+        !isSubmitButton(element);
+}
+
+
+// A button that really submits the quiz ("Submit all and finish").
+// The extension never clicks it.
+function isSubmitButton(element) {
+    return /\bsubmit\b/i.test(buttonLabel(element));
 }
 
 
 // Find the "Next" button.
 function findNextButton() {
     // Your practice page's own button, and the Moodle one.
+    // On the last Moodle page the Moodle button says
+    // "Finish attempt ..." and is allowed.
     const known = document.querySelector(
         "#next-question, #mod_quiz-next-nav"
     );
 
-    // CHANGED: on the last Moodle page this same button says
-    // "Finish attempt ...". It must NOT be clicked.
     if (
         known &&
         !isDisabledElement(known) &&
         isVisible(known) &&
-        !isFinishButton(known)
+        !isSubmitButton(known)
     ) {
         return known;
     }
 
     // Other pages: a button whose whole text is "Next",
     // "Next Question", "Next Page" or "Continue".
-    // Buttons such as "Submit" or "Finish" are never clicked.
+    // Buttons such as "Submit" are never clicked.
     const elements = Array.from(
         document.querySelectorAll(
             "button, input[type='button'], input[type='submit'], " +
@@ -2798,11 +3060,7 @@ function findNextButton() {
             return false;
         }
 
-        const raw = element instanceof HTMLInputElement
-            ? element.value
-            : element.textContent;
-
-        const label = clean(raw || "").replace(
+        const label = buttonLabel(element).replace(
             /\s*[>\u00BB\u2192\u203A]+\s*$/,
             ""
         );
@@ -3103,18 +3361,7 @@ function countVisibleQuestionContainers() {
 function typeIntoQuestionField(candidate, answer) {
     const container = candidate.element;
 
-    const fields = Array.from(
-        container.querySelectorAll(
-            "input:not([type]), input[type='text'], " +
-            "input[type='search'], textarea"
-        )
-    ).filter((field) => {
-        return (
-            !field.disabled &&
-            !field.readOnly &&
-            isVisible(field)
-        );
-    });
+    const fields = visibleTextFields(container);
 
     if (fields.length === 0) {
         return null;
