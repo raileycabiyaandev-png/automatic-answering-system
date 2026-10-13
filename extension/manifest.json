@@ -11,7 +11,8 @@
     "http://127.0.0.1:8000/*",
     "http://localhost:8000/*",
     "https://automatic-answering-system.onrender.com/*",
-    "https://semestral.amaes.com/*"
+    "https://semestral.amaes.com/*",
+    "https://semestralexam.amaes.com/*"
   ],
   "background": {
     "service_worker": "background.js"
@@ -26,7 +27,8 @@
         "http://localhost/*",
         "http://127.0.0.1/*",
         "https://automatic-answering-system.onrender.com/*",
-        "https://semestral.amaes.com/*"
+        "https://semestral.amaes.com/*",
+        "https://semestralexam.amaes.com/*"
       ],
       "js": [
         "content.js"

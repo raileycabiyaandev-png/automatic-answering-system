@@ -22,7 +22,8 @@ const ALLOWED_HOSTS = [
     "localhost",
     "127.0.0.1",
     "automatic-answering-system.onrender.com",
-    "semestral.amaes.com"
+    "semestral.amaes.com",
+    "semestralexam.amaes.com",
 ];
 
 let enabled = false;
