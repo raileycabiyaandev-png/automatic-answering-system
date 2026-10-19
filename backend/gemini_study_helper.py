@@ -9,7 +9,9 @@ from google import genai
 from google.genai import types
 
 
-# The first model is used normally. If it is busy, out of quota or
+# MODELS (changed for accuracy)
+# The first model is used normally. gemini-3.8-flash is the newest
+# and smartest "Flash" model and is on the free plan. If it is busy, out of quota or
 # not available, the next one is tried automatically.
 # You can put your own first choice in the GEMINI_MODEL setting
 # on Render.
@@ -18,9 +20,11 @@ MODEL_NAMES = [
     for name in dict.fromkeys(
         [
             os.environ.get("GEMINI_MODEL", "").strip(),
-            "gemini-3.5-flash-lite",
-            "gemini-2.5-flash-lite",
+            "gemini-3.8-flash",      # newest Flash: the most accurate
+            "gemini-3.6-flash",
+            "gemini-3.5-flash",
             "gemini-2.5-flash",
+            "gemini-3.5-flash-lite",  # fast but less accurate: last choice
         ]
     )
     if name
@@ -35,11 +39,12 @@ _LETTERS = "ABCDEFGHIJKLMNOPQRST"
 # TIME LIMITS (NEW)
 # The extension gives up on a backend request after 25 seconds
 # and starts it again. So the backend must finish BEFORE that.
-#   - One Gemini call waits at most 10 seconds.
-#   - No new Gemini call starts after 12 seconds in total.
+#   - One Gemini call waits at most 14 seconds (the model now
+#     "thinks" before it answers, which needs a little more time).
+#   - No new Gemini call starts after 10 seconds in total.
 # ------------------------------------------------------------
-_CALL_TIMEOUT_MS = 10000
-_NO_NEW_CALL_AFTER_SECONDS = 12
+_CALL_TIMEOUT_MS = 14000
+_NO_NEW_CALL_AFTER_SECONDS = 10
 
 # A model that does not exist is skipped for 10 minutes, so we
 # do not waste time asking it again and again.
@@ -56,7 +61,7 @@ _DEAD_SECONDS = 600
 _client = None
 _client_lock = threading.Lock()
 
-_variant_index = 0          # remembers which config works
+_variant_index: dict = {}   # remembers which config works, per model
 _cache: dict = {}
 _CACHE_LIMIT = 1000
 
@@ -86,23 +91,36 @@ def _get_client():
         return _client
 
 
-def _config_variants(max_tokens: int, json_mode: bool = False) -> list:
-    """Fastest settings first, plain settings last (safe fallback)."""
+# How much the model may think before it answers.
+# More thinking = more accurate, but a little slower.
+_THINKING_BUDGETS = {"low": 512, "medium": 2048, "high": 4096}
+_THINKING_ROOM = 6000   # thinking words also count as output
+
+
+def _config_variants(
+    max_tokens: int,
+    json_mode: bool = False,
+    level: str = "medium",
+) -> list:
+    """
+    Thinking ON first (accurate). If a model does not accept it,
+    the next setting is tried, and plain settings are the last try.
+    """
     variants = []
 
     for thinking in (
-        {"thinking_budget": 0},
-        {"thinking_level": "minimal"},
+        {"thinking_level": level},
+        {"thinking_budget": _THINKING_BUDGETS.get(level, 2048)},
         None,
     ):
         try:
-            kwargs = {"temperature": 0}
+            kwargs = {}
 
             if json_mode:
                 kwargs["response_mime_type"] = "application/json"
 
             if thinking is not None:
-                kwargs["max_output_tokens"] = max_tokens
+                kwargs["max_output_tokens"] = max_tokens + _THINKING_ROOM
                 kwargs["thinking_config"] = types.ThinkingConfig(**thinking)
 
             variants.append(types.GenerateContentConfig(**kwargs))
@@ -168,14 +186,18 @@ def _call_model(client, model: str, prompt: str, config, started: float):
             raise
 
 
-def _generate(client, prompt: str, max_tokens: int, json_mode: bool = False):
+def _generate(
+    client,
+    prompt: str,
+    max_tokens: int,
+    json_mode: bool = False,
+    level: str = "medium",
+):
     """
     Call Gemini with the fastest config that the model accepts.
     If a model is busy, out of quota or missing, the next model in
     MODEL_NAMES is used. Stops early when time is almost up.
     """
-    global _variant_index
-
     started = time.monotonic()
     last_error = None
 
@@ -186,9 +208,10 @@ def _generate(client, prompt: str, max_tokens: int, json_mode: bool = False):
         if dead_until > time.time():
             continue
 
-        variants = _config_variants(max_tokens, json_mode)
+        variants = _config_variants(max_tokens, json_mode, level)
 
-        start = min(_variant_index, len(variants) - 1)
+        memory_key = (model, level)
+        start = min(_variant_index.get(memory_key, 0), len(variants) - 1)
 
         for i in range(start, len(variants)):
             if time.monotonic() - started > _NO_NEW_CALL_AFTER_SECONDS:
@@ -210,7 +233,7 @@ def _generate(client, prompt: str, max_tokens: int, json_mode: bool = False):
 
                 if _is_config_error(exc):
                     # This setting does not suit the model.
-                    _variant_index = i + 1
+                    _variant_index[memory_key] = i + 1
                     continue
 
                 # Busy or out of quota: try the next model.
@@ -227,10 +250,10 @@ def _generate(client, prompt: str, max_tokens: int, json_mode: bool = False):
             # suit the model. Move on to the next one.
             if not text and i < len(variants) - 1:
                 last_error = RuntimeError("Gemini returned an empty answer.")
-                _variant_index = i + 1
+                _variant_index[memory_key] = i + 1
                 continue
 
-            _variant_index = i
+            _variant_index[memory_key] = i
             return response
 
     raise last_error or RuntimeError("Gemini request failed.")
@@ -398,19 +421,20 @@ def _answer_multiple_choice(client, subject, question, choices):
     multi = _is_multi(question, choices)
 
     if multi:
-        instructions = (
-            "- This question can have MORE THAN ONE correct choice.\n"
-            "- Pick ALL the correct choices.\n"
-            "- Reply with ONLY the letters, separated by commas "
-            "(for example: A, C, D).\n"
-            "- Do not explain."
-        )
+        how = """- More than one choice can be correct.
+- Reply with ONLY the letters of ALL the correct choices, separated
+  by commas (example: A, C, D).
+- For questions such as "Enumerate", "List", "Cite examples" or
+  "Identify the features / challenges / types / components /
+  advantages", usually SEVERAL choices are correct. Include every
+  choice that really belongs to that list. Leave out only the
+  choices that clearly do not belong.
+- If the question mentions "Known correct choice(s) from the answer
+  key", those are correct. Keep them and add any other correct
+  choices."""
     else:
-        instructions = (
-            "- Pick the single best choice.\n"
-            "- Reply with ONLY the letter (for example: B).\n"
-            "- Do not explain."
-        )
+        how = """- Exactly one choice is correct.
+- Reply with ONLY its letter (example: B)."""
 
     choice_lines = "\n".join(
         f"{_LETTERS[i]}. {text}"
@@ -418,7 +442,8 @@ def _answer_multiple_choice(client, subject, question, choices):
     )
 
     prompt = f"""
-Subject: {subject}
+You are an expert in {subject} answering a university exam.
+Use standard textbook and lecture-slide knowledge of this subject.
 
 Question:
 {question}
@@ -426,12 +451,15 @@ Question:
 Choices:
 {choice_lines}
 
-Instructions:
-{instructions}
+How to answer:
+- Check EVERY choice one by one: is it correct for this question?
+- Watch for words such as NOT, EXCEPT, FALSE, LEAST and ONLY.
+{how}
+- Do not explain.
 """
 
     response = _generate(
-        client, prompt, max_tokens=30 if multi else 8
+        client, prompt, max_tokens=40 if multi else 10
     )
 
     raw = (response.text or "").strip()
@@ -444,7 +472,8 @@ Instructions:
 
 def _answer_open_question(client, subject, question):
     prompt = f"""
-Subject: {subject}
+You are an expert in {subject} answering a university exam.
+Use standard textbook and lecture-slide knowledge of this subject.
 
 Question:
 {question}
@@ -542,7 +571,8 @@ def _ask_batch(client, subject, todo) -> dict:
     questions_text = "\n\n".join(blocks)
 
     prompt = f"""
-Subject: {subject}
+You are an expert in {subject} answering a university exam.
+Use standard textbook and lecture-slide knowledge of this subject.
 
 Answer every numbered question below.
 
@@ -552,9 +582,15 @@ Each element must look like: {{"id": 1, "answer": "..."}}
 Rules for "answer":
 - If the question has lettered choices, "answer" is ONLY the letter
   of the best choice, for example "B".
+- Check every choice one by one. Watch for NOT, EXCEPT, FALSE, ONLY.
 - If the question says "Select one or more", more than one choice can
   be correct. Then "answer" is ALL the correct letters separated by
-  commas, for example "A, C, D".
+  commas, for example "A, C, D". For "Enumerate", "List", "Cite
+  examples" or "Identify the features / challenges / types", usually
+  SEVERAL choices are correct: include every choice that really
+  belongs and leave out only those that clearly do not.
+- If the question mentions "Known correct choice(s) from the answer
+  key", keep those and add any other correct choices.
 - Otherwise "answer" is the shortest accurate answer (a word or a
   short phrase).
 - If the question asks to list or enumerate several items, put all
@@ -569,7 +605,12 @@ Questions:
     max_tokens = min(8000, 80 * len(todo) + 300)
 
     response = _generate(
-        client, prompt, max_tokens=max_tokens, json_mode=True
+        client,
+        prompt,
+        max_tokens=max_tokens,
+        json_mode=True,
+        # A very long batch thinks less, so it stays fast enough.
+        level="low" if len(todo) > 8 else "medium",
     )
 
     return _parse_batch_json((response.text or "").strip())

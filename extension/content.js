@@ -658,6 +658,41 @@ async function lookupAndShow(candidate) {
     // The database found an answer AND we can pick a choice
     // (or there are no choices to pick from).
     if (match.matched && answerFitsChoices(candidate, match)) {
+        // Only ONE choice on a "select one or more" item: let the
+        // AI finish the list (the database choice is kept).
+        if (needsAiCompletion(candidate, match)) {
+            try {
+                const response = await sendToBackground({
+                    type: "STUDY_HELP",
+                    payload: {
+                        subject,
+                        question: aiQuestionText(
+                            candidate,
+                            knownPicksText(candidate, match)
+                        ),
+                        choices: candidate.choices
+                    }
+                });
+
+                if (!enabled) {
+                    return;
+                }
+
+                if (response?.ok && validAiResult(response.result)) {
+                    const merged = mergePicks(
+                        candidate, match, response.result
+                    );
+
+                    if (merged) {
+                        displayMatchResult(candidate, merged);
+                        return;
+                    }
+                }
+            } catch (error) {
+                console.warn("AI check skipped:", error.message);
+            }
+        }
+
         displayMatchResult(candidate, match);
         return;
     }
@@ -1617,6 +1652,13 @@ function displayMatchResult(candidate, result, allowAuto = true) {
         lines.push("", "Found using:", result.searched_text);
     }
 
+    if (result.ai_completed) {
+        lines.push(
+            "",
+            "The AI added more correct choices to the database answer."
+        );
+    }
+
     lines.push(
         "",
         "Source:",
@@ -2181,10 +2223,79 @@ async function sendWithRetry(message) {
 const MULTI_HINT =
     "\n(Select one or more: choose ALL the correct answers.)";
 
-function aiQuestionText(candidate) {
-    return candidate.multi && candidate.choices.length > 0
-        ? candidate.question + MULTI_HINT
-        : candidate.question;
+function aiQuestionText(candidate, known = "") {
+    if (!(candidate.multi && candidate.choices.length > 0)) {
+        return candidate.question;
+    }
+
+    let text = candidate.question + MULTI_HINT;
+
+    if (known) {
+        text +=
+            "\nKnown correct choice(s) from the answer key: " +
+            known +
+            ". There may be MORE correct choices.";
+    }
+
+    return text;
+}
+
+
+// ------------------------------------------------------------
+// "Select one or more" and the database gave only ONE choice.
+// The answer key may be incomplete, so the AI is asked to finish
+// the list. The database choice is always kept.
+// ------------------------------------------------------------
+function needsAiCompletion(candidate, match) {
+    return (
+        candidate.multi &&
+        candidate.choices.length >= 3 &&
+        choiceIndexesFor(
+            candidate.choices,
+            match.answer,
+            match,
+            true
+        ).length === 1
+    );
+}
+
+
+function knownPicksText(candidate, match) {
+    return choiceIndexesFor(
+        candidate.choices,
+        match.answer,
+        match,
+        true
+    )
+        .map((index) => clean(stripChoicePrefix(candidate.choices[index])))
+        .join("; ");
+}
+
+
+// Database picks + AI picks. Returns null when the AI added nothing.
+function mergePicks(candidate, match, aiResult) {
+    const dbPicks = choiceIndexesFor(
+        candidate.choices, match.answer, match, true
+    );
+
+    const aiPicks = choiceIndexesFor(
+        candidate.choices, aiResult.answer, aiResult, true
+    );
+
+    const all = unique([...dbPicks, ...aiPicks]).sort((a, b) => a - b);
+
+    if (all.length <= dbPicks.length) {
+        return null;
+    }
+
+    return {
+        ...match,
+        answer: all
+            .map((i) => clean(stripChoicePrefix(candidate.choices[i])))
+            .join("\n"),
+        choice_indexes: all,
+        ai_completed: true
+    };
 }
 
 
@@ -2205,7 +2316,7 @@ async function askAiSingle(item) {
                 type: "STUDY_HELP",
                 payload: {
                     subject,
-                    question: aiQuestionText(item.candidate),
+                    question: aiQuestionText(item.candidate, item.known),
                     choices: item.candidate.choices
                 }
             })
@@ -2236,7 +2347,7 @@ async function askAiBatch(items) {
                 subject,
                 items: items.map((item, index) => ({
                     id: index,
-                    question: aiQuestionText(item.candidate),
+                    question: aiQuestionText(item.candidate, item.known),
                     choices: item.candidate.choices
                 }))
             }
@@ -2281,9 +2392,9 @@ function flushAiQueue() {
 
 // Questions that need the AI wait here for a moment so that they
 // can travel together in one request.
-function requestAiAnswer(candidate) {
+function requestAiAnswer(candidate, known = "") {
     return new Promise((resolve, reject) => {
-        aiQueue.push({ candidate, resolve, reject });
+        aiQueue.push({ candidate, known, resolve, reject });
 
         if (!aiFlushTimer) {
             aiFlushTimer = setTimeout(
@@ -2322,6 +2433,37 @@ async function resolveQuestion(candidate) {
 
         // The database answer must point to a choice on the page.
         if (match.matched && answerFitsChoices(candidate, match)) {
+            // Only ONE choice on a "select one or more" item: let the
+            // AI finish the list (the database choice is kept).
+            if (needsAiCompletion(candidate, match)) {
+                const aiPromise = requestAiAnswer(
+                    candidate,
+                    knownPicksText(candidate, match)
+                );
+                finishMatch();
+
+                try {
+                    const aiResult = await aiPromise;
+                    const merged = mergePicks(candidate, match, aiResult);
+
+                    if (merged) {
+                        return {
+                            kind: "database",
+                            answer: merged.answer,
+                            result: merged
+                        };
+                    }
+                } catch (error) {
+                    console.warn("AI check skipped:", error.message);
+                }
+
+                return {
+                    kind: "database",
+                    answer: match.answer,
+                    result: match
+                };
+            }
+
             finishMatch();
 
             return {
