@@ -299,6 +299,59 @@ def _choice_result(choices: list[str], raw: str) -> dict:
     return _open_result(raw)
 
 
+# The extension adds this line to "Select one or more" questions
+# (see MULTI_HINT in content.js).
+_MULTI_RE = re.compile(r"select one or more", re.IGNORECASE)
+
+
+def _is_multi(question: str, choices: list[str]) -> bool:
+    return bool(choices) and bool(_MULTI_RE.search(question or ""))
+
+
+def _multi_choice_result(choices: list[str], raw: str) -> dict:
+    """Gemini may name SEVERAL letters, for example "A, C, D"."""
+    valid = _LETTERS[: len(choices)]
+
+    words = re.findall(r"[A-Za-z]+", raw)
+
+    letters = [
+        word.upper()
+        for word in words
+        if len(word) == 1 and word.upper() in valid
+    ]
+
+    # Only trust it when the reply is made of letters (and "and").
+    only_letters = all(
+        len(word) == 1 or word.lower() == "and" for word in words
+    )
+
+    if not letters or not only_letters:
+        # Not a clean list of letters. Return the text and let the
+        # extension try to match it with the choices.
+        return _open_result(raw)
+
+    indexes = sorted({valid.index(letter) for letter in letters})
+
+    return {
+        "answer": "\n".join(choices[i] for i in indexes),
+        "answers": [choices[i] for i in indexes],
+        "choice_index": indexes[0],
+        "choice_indexes": indexes,
+        "choice_label": valid[indexes[0]],
+        "choice_labels": [valid[i] for i in indexes],
+        "source_type": "gemini_model_knowledge",
+        "sources": [],
+        "disclaimer": _DISCLAIMER,
+    }
+
+
+def _pick_result(question: str, choices: list[str], raw: str) -> dict:
+    if _is_multi(question, choices):
+        return _multi_choice_result(choices, raw)
+
+    return _choice_result(choices, raw)
+
+
 def _open_result(answer: str) -> dict:
     return {
         "answer": answer.strip(),
@@ -342,6 +395,23 @@ def get_study_help(
 
 
 def _answer_multiple_choice(client, subject, question, choices):
+    multi = _is_multi(question, choices)
+
+    if multi:
+        instructions = (
+            "- This question can have MORE THAN ONE correct choice.\n"
+            "- Pick ALL the correct choices.\n"
+            "- Reply with ONLY the letters, separated by commas "
+            "(for example: A, C, D).\n"
+            "- Do not explain."
+        )
+    else:
+        instructions = (
+            "- Pick the single best choice.\n"
+            "- Reply with ONLY the letter (for example: B).\n"
+            "- Do not explain."
+        )
+
     choice_lines = "\n".join(
         f"{_LETTERS[i]}. {text}"
         for i, text in enumerate(choices)
@@ -357,19 +427,19 @@ Choices:
 {choice_lines}
 
 Instructions:
-- Pick the single best choice.
-- Reply with ONLY the letter (for example: B).
-- Do not explain.
+{instructions}
 """
 
-    response = _generate(client, prompt, max_tokens=8)
+    response = _generate(
+        client, prompt, max_tokens=30 if multi else 8
+    )
 
     raw = (response.text or "").strip()
 
     if not raw:
         raise RuntimeError("Gemini returned an empty answer.")
 
-    return _choice_result(choices, raw)
+    return _pick_result(question, choices, raw)
 
 
 def _answer_open_question(client, subject, question):
@@ -444,7 +514,7 @@ def get_study_help_batch(subject: str, items: list[dict]) -> list[dict]:
                 continue
 
             result = (
-                _choice_result(choices, raw)
+                _pick_result(question, choices, raw)
                 if choices
                 else _open_result(raw)
             )
@@ -482,6 +552,9 @@ Each element must look like: {{"id": 1, "answer": "..."}}
 Rules for "answer":
 - If the question has lettered choices, "answer" is ONLY the letter
   of the best choice, for example "B".
+- If the question says "Select one or more", more than one choice can
+  be correct. Then "answer" is ALL the correct letters separated by
+  commas, for example "A, C, D".
 - Otherwise "answer" is the shortest accurate answer (a word or a
   short phrase).
 - If the question asks to list or enumerate several items, put all

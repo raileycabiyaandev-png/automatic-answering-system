@@ -868,7 +868,7 @@ async function requestStudyHelp(candidate) {
         type: "STUDY_HELP",
         payload: {
             subject,
-            question: candidate.question,
+            question: aiQuestionText(candidate),
             choices: candidate.choices
         }
     });
@@ -2176,6 +2176,18 @@ async function sendWithRetry(message) {
 }
 
 
+// The backend only sees the question text. For "select one or
+// more" items we add this line, so the AI picks ALL correct answers.
+const MULTI_HINT =
+    "\n(Select one or more: choose ALL the correct answers.)";
+
+function aiQuestionText(candidate) {
+    return candidate.multi && candidate.choices.length > 0
+        ? candidate.question + MULTI_HINT
+        : candidate.question;
+}
+
+
 function validAiResult(result) {
     return (
         result &&
@@ -2193,7 +2205,7 @@ async function askAiSingle(item) {
                 type: "STUDY_HELP",
                 payload: {
                     subject,
-                    question: item.candidate.question,
+                    question: aiQuestionText(item.candidate),
                     choices: item.candidate.choices
                 }
             })
@@ -2224,7 +2236,7 @@ async function askAiBatch(items) {
                 subject,
                 items: items.map((item, index) => ({
                     id: index,
-                    question: item.candidate.question,
+                    question: aiQuestionText(item.candidate),
                     choices: item.candidate.choices
                 }))
             }
@@ -3241,6 +3253,38 @@ function answerPieces(answer, result) {
 }
 
 
+// NEW: reads answers written only as letters:
+// "a, c, d"   "B and C"   "a & d"   "a c d"   "ACD"
+// Returns the letters (A-H). Returns [] when the text is not
+// just letters.
+function lettersInAnswer(text) {
+    const cleaned = String(text || "")
+        .trim()
+        .replace(/^(?:answers?|options?|choices?|ans)\s*[:\-]?\s*/i, "")
+        .replace(/[.\s]+$/, "");
+
+    if (!cleaned) {
+        return [];
+    }
+
+    const separated =
+        /^[A-H](?:(?:\s*(?:,|;|&|\/|\+|\band\b)\s*|\s+)[A-H])*$/i;
+
+    // "ACD" (no spaces) only counts when written in capitals.
+    const compact = /^[A-H]{2,8}$/;
+
+    if (!separated.test(cleaned) && !compact.test(cleaned)) {
+        return [];
+    }
+
+    return cleaned
+        .replace(/\band\b/gi, " ")
+        .replace(/[^A-Ha-h]/g, " ")
+        .toUpperCase()
+        .match(/[A-H]/g) || [];
+}
+
+
 // NEW: finds EVERY choice the answer points to.
 // One-answer questions (radio buttons) give at most one index.
 function choiceIndexesFor(choices, answer, result, multi) {
@@ -3254,6 +3298,17 @@ function choiceIndexesFor(choices, answer, result, multi) {
         const single = choiceIndexFor(choices, answer, result);
 
         return single === -1 ? [] : [single];
+    }
+
+    // The backend sent the exact choice numbers: use them.
+    if (Array.isArray(result.choice_indexes)) {
+        const exact = result.choice_indexes.filter(
+            (n) => Number.isInteger(n) && n >= 0 && n < choices.length
+        );
+
+        if (exact.length > 0) {
+            return unique(exact).sort((a, b) => a - b);
+        }
     }
 
     const pieces = answerPieces(answer, result);
@@ -3277,10 +3332,9 @@ function choiceIndexesFor(choices, answer, result, multi) {
             }
         });
 
-        const letter = piece.trim().match(/^(?:option\s+)?([A-H])$/i);
-
-        if (letter) {
-            const index = letter[1].toUpperCase().charCodeAt(0) - 65;
+        // Letters: "C", "a, c, d", "B and C".
+        for (const letter of lettersInAnswer(piece)) {
+            const index = letter.charCodeAt(0) - 65;
 
             if (index < choices.length) {
                 found.add(index);
